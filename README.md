@@ -31,8 +31,8 @@ Event-driven OpenRGB profile switcher for Linux. Zero idle CPU, fully configurab
 │  │ (UPower) │  │ (DBus    │  │ (Hold    │  │ (MPRIS     │  │
 │  │ + sysfs) │  │  monitor)│  │  source) │  │  players)  │  │
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬──────┘  │
-│       │             │             │             │          │
-│       └─────────────┴──────┬──────┴─────────────┘          │
+│       │             │             │              │         │
+│       └─────────────┴──────┬──────┴──────────────┘         │
 │                            ▼                               │
 │              ┌───────────────────────┐                     │
 │              │   Priority Evaluator  │                     │
