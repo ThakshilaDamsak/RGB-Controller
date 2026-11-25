@@ -2,6 +2,9 @@
 
 Event-driven OpenRGB profile switcher for Linux. Zero idle CPU, fully configurable via GUI.
 
+> [!NOTE]
+> This is a vibecoded project. Use with caution if you are gonna use it for whatever reason.
+
 ## Features
 
 - **Zero idle overhead** — Pure event-driven (DBus signals, MPRIS, inotify, pidfd). No polling loops.
@@ -19,42 +22,42 @@ Event-driven OpenRGB profile switcher for Linux. Zero idle CPU, fully configurab
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    rgb-controller (daemon)                   │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐   │
-│  │ AC Power │  │ Loading  │  │ Gaming   │  │ Media      │   │
-│  │ (UPower) │  │ (DBus    │  │ (Hold    │  │ (MPRIS     │   │
-│  │ + sysfs) │  │  monitor)│  │  source) │  │  players)  │   │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬──────┘   │
-│       │             │             │             │            │
-│       └─────────────┴──────┬──────┴─────────────┘            │
-│                            ▼                                  │
-│              ┌───────────────────────┐                        │
-│              │   Priority Evaluator  │                        │
-│              │  (first match wins)   │                        │
-│              └───────────┬───────────┘                        │
-│                          ▼                                    │
-│              ┌───────────────────────┐                        │
-│              │    Profile Runner     │                        │
-│              │ (openrgb --profile X) │                        │
-│              │  retries, timeouts    │                        │
-│              └───────────────────────┘                        │
-└─────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│                    rgb-controller (daemon)                 │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
+│  │ AC Power │  │ Loading  │  │ Gaming   │  │ Media      │  │
+│  │ (UPower) │  │ (DBus    │  │ (Hold    │  │ (MPRIS     │  │
+│  │ + sysfs) │  │  monitor)│  │  source) │  │  players)  │  │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬──────┘  │
+│       │             │             │             │          │
+│       └─────────────┴──────┬──────┴─────────────┘          │
+│                            ▼                               │
+│              ┌───────────────────────┐                     │
+│              │   Priority Evaluator  │                     │
+│              │  (first match wins)   │                     │
+│              └───────────┬───────────┘                     │
+│                          ▼                                 │
+│              ┌───────────────────────┐                     │
+│              │    Profile Runner     │                     │
+│              │ (openrgb --profile X) │                     │
+│              │  retries, timeouts    │                     │
+│              └───────────────────────┘                     │
+└────────────────────────────────────────────────────────────┘
                             ▲
               ┌─────────────┴─────────────┐
               ▼                           ▼
-    ┌───────────────────┐        ┌───────────────────┐
+    ┌───────────────────┐        ┌────────────────────┐
     │   rgbctl (CLI)    │        │ rgb-controller-gui │
     │  status, pin,     │        │  (Qt6, tray,       │
     │  hold, run, log   │        │   live view)       │
-    └───────────────────┘        └───────────────────┘
+    └───────────────────┘        └────────────────────┘
               ▲                           ▲
               │                           │
-    ┌─────────┴─────────┐        ┌────────┴────────┐
-    │  game-rgb (Lutris)│        │  rgb-loading.fish│
-    │  start / stop     │        │  pacman, paru,   │
-    │  hold for PID     │        │  yay, etc.       │
-    └───────────────────┘        └─────────────────┘
+    ┌─────────┴──────────┐       ┌────────┴──────────┐
+    │  game-rgb (Lutris) │       │  rgb-loading.fish │
+    │  start / stop      │       │  pacman, paru,    │
+    │  hold for PID      │       │  yay, etc.        │
+    └────────────────────┘       └───────────────────┘
 ```
 
 ## Installation
