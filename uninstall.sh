@@ -4,6 +4,13 @@
 
 set -euo pipefail
 
+# Check for root/sudo
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: This script must be run as root (use sudo)." >&2
+    echo "Usage: sudo ./uninstall.sh" >&2
+    exit 1
+fi
+
 BIN_DIR="/usr/local/bin"
 SYSTEMD_USER_DIR="/usr/lib/systemd/user"
 DESKTOP_DIR="/usr/share/applications"

@@ -148,17 +148,24 @@ def dump_toml(overrides):
 
 
 def scan_profiles():
-    """OpenRGB keeps one <name>.orp per profile in its config dir (native or flatpak)."""
+    """OpenRGB keeps one <name>.orp or <name>.json per profile in its config dir (native or flatpak)."""
     home = os.path.expanduser("~")
     cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
-    dirs = [os.path.join(cfg, "OpenRGB"), os.path.join(home, ".var/app/org.openrgb.OpenRGB/config/OpenRGB")]
+    dirs = [
+        os.path.join(cfg, "OpenRGB"),
+        os.path.join(home, ".var/app/org.openrgb.OpenRGB/config/OpenRGB"),
+        os.path.join(cfg, "openrgb"),
+        os.path.join(home, ".local/share/OpenRGB"),
+        os.path.join(home, ".local/share/openrgb"),
+    ]
     names = {}
     for d in dirs:
-        for pattern in ("*.orp", "profiles/*.orp"):
+        for pattern in ("*.orp", "profiles/*.orp", "Profiles/*.orp", "*.json", "profiles/*.json", "Profiles/*.json"):
             for f in glob.glob(os.path.join(d, pattern)):
                 stem = os.path.splitext(os.path.basename(f))[0]
                 names.setdefault(stem.lower(), stem)
-    return sorted(names.values(), key=str.lower), [d for d in dirs if os.path.isdir(d)]
+    found_dirs = [d for d in dirs if os.path.isdir(d)]
+    return sorted(names.values(), key=str.lower), found_dirs
 
 
 def gui_prefs_path():

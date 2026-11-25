@@ -4,6 +4,13 @@
 
 set -euo pipefail
 
+# Check for root/sudo
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: This script must be run as root (use sudo)." >&2
+    echo "Usage: sudo ./install.sh" >&2
+    exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="/usr/local/bin"
 SYSTEMD_USER_DIR="/usr/lib/systemd/user"
@@ -80,9 +87,13 @@ echo "  2. The daemon is now running (or will start on next login)."
 echo "  3. Open the GUI with: rgb-controller-gui"
 echo "  4. Configure your profiles and triggers in the GUI."
 echo ""
-echo "For Lutris integration:"
-echo "  - Pre-launch script: game-rgb start"
-echo "  - Post-exit script:  game-rgb stop"
+echo "For Lutris integration (recommended - wrapper mode, like game-performance):"
+echo "  Game config → System options → Command prefix:  game-rgb run"
+echo ""
+echo "For Steam:"
+echo "  Properties → Launch Options:  game-rgb run %command%"
+echo ""
+echo "(Legacy pre/post scripts still work: game-rgb start / game-rgb stop)"
 echo ""
 echo "For Fish shell (terminal package manager tracking):"
 echo "  The fish wrapper is installed. Restart your terminal or run:"
@@ -90,5 +101,8 @@ echo "  source /usr/share/fish/vendor_conf.d/rgb-loading.fish"
 echo ""
 echo "To customize which commands trigger the Loading profile:"
 echo "  set -U rgb_loading_cmds pacman paru yay cachyos-rate-mirrors flatpak topgrade"
+echo ""
+echo "Media OFF delay (prevents flicker when scrolling past videos):"
+echo "  GUI → Timing page → \"Media OFF delay\" (default 30s, set 0 for instant)"
 echo ""
 echo "Uninstall with: sudo ./uninstall.sh"
