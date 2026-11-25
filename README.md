@@ -65,7 +65,7 @@ Event-driven OpenRGB profile switcher for Linux. Zero idle CPU, fully configurab
 ### Quick Install (Arch-based)
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/ThakshilaDamsak/RGB-Controller.git
 cd RGB
 sudo ./install.sh
 ```
