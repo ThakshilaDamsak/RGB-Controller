@@ -1,0 +1,16 @@
+[Unit]
+Description=Event-driven OpenRGB profile controller
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.rgbcontroller.Daemon
+ExecStart=@BIN@/rgb-controller
+Restart=on-failure
+RestartSec=3
+Nice=5
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target

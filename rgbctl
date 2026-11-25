@@ -1,0 +1,94 @@
+#!/bin/sh
+# rgbctl: tiny command line for the rgb-controller daemon (talks D-Bus through busctl, no other deps).
+#
+#   rgbctl status [--raw]            what is it doing and why
+#   rgbctl pin PROFILE [30m|2h|90s]  force a profile (no duration = until `rgbctl unpin`)
+#   rgbctl unpin
+#   rgbctl reload | reevaluate       re-read config.toml | re-apply the current profile
+#   rgbctl log                       recent daemon log lines
+#   rgbctl hold SOURCE TOKEN [PID]   hold/release a state by hand (SOURCE: loading, gaming)
+#   rgbctl release SOURCE TOKEN
+#   rgbctl run SOURCE -- CMD ARGS... hold SOURCE for as long as CMD runs (what the Fish wrapper uses)
+#   rgbctl gui                       open the GUI
+
+SVC=org.rgbcontroller.Daemon
+OBJ=/org/rgbcontroller/Daemon
+IFACE=org.rgbcontroller.Daemon1
+
+call() { busctl --user --timeout=3 call "$SVC" "$OBJ" "$IFACE" "$@"; }
+quiet() { call "$@" >/dev/null 2>&1; }
+
+secs() {
+    case $1 in
+        '' | 0) echo 0 ;;
+        *h) echo $((${1%h} * 3600)) ;;
+        *m) echo $((${1%m} * 60)) ;;
+        *s) echo "${1%s}" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+json_call() { # METHOD -> raw JSON string on stdout
+    busctl --user --timeout=3 --json=short call "$SVC" "$OBJ" "$IFACE" "$1" 2>/dev/null |
+        python3 -c 'import sys, json; print(json.load(sys.stdin)["data"][0])'
+}
+
+case ${1:-status} in
+    status)
+        raw=$(json_call Status) || { echo "rgb-controller is not running" >&2; exit 1; }
+        [ -n "$raw" ] || { echo "rgb-controller is not running" >&2; exit 1; }
+        if [ "${2:-}" = "--raw" ]; then
+            echo "$raw"
+        else
+            echo "$raw" | python3 -c '
+import sys, json
+s = json.load(sys.stdin)
+print(f"now      {s[\"target\"]}   (because: {s[\"reason\"]})")
+print(f"applied  {s[\"applied\"]}" + ("   !! openrgb keeps failing" if s["failing"] else ""))
+print(f"priority ac > " + " > ".join(o for o in s["order"] if o != "ac"))
+print("monitoring " + ("on" if s["monitoring"] else "paused (on battery)") + ("   [suspended]" if s["sleeping"] else ""))
+for name, d in s["sources"].items():
+    print(f"  {name:9} {json.dumps(d)}")
+'
+        fi
+        ;;
+    pin)
+        [ -n "${2:-}" ] || { echo "usage: rgbctl pin PROFILE [DURATION]" >&2; exit 2; }
+        call Pin si "$2" "$(secs "${3:-0}")" >/dev/null
+        ;;
+    unpin) call Unpin >/dev/null ;;
+    reload) call Reload >/dev/null ;;
+    reevaluate) call Reevaluate >/dev/null ;;
+    log) json_call History | python3 -c 'import sys, json; print("\n".join(json.load(sys.stdin)))' ;;
+    hold)
+        [ $# -ge 3 ] || { echo "usage: rgbctl hold SOURCE TOKEN [PID]" >&2; exit 2; }
+        call Hold ssu "$2" "$3" "${4:-0}" >/dev/null
+        ;;
+    release)
+        [ $# -ge 3 ] || { echo "usage: rgbctl release SOURCE TOKEN" >&2; exit 2; }
+        call Release ss "$2" "$3" >/dev/null
+        ;;
+    run)
+        src=${2:-}
+        [ -n "$src" ] || { echo "usage: rgbctl run SOURCE -- CMD ARGS..." >&2; exit 2; }
+        shift 2
+        [ "${1:-}" = "--" ] && shift
+        [ $# -gt 0 ] || { echo "rgbctl run: no command given" >&2; exit 2; }
+        tok="$src-$$"
+        # The hold is tied to this shell's pid: if we are killed, the daemon notices and lets go.
+        quiet Hold ssu "$src" "$tok" "$$" || true
+        release() { quiet Release ss "$src" "$tok" || true; }
+        trap : INT # let the child handle Ctrl-C; we release afterwards
+        trap 'release; exit 143' TERM HUP
+        "$@"
+        rc=$?
+        release
+        exit "$rc"
+        ;;
+    gui) exec rgb-controller-gui "$@" ;;
+    -h | --help | help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *)
+        echo "rgbctl: unknown command '$1' (try: rgbctl help)" >&2
+        exit 2
+        ;;
+esac

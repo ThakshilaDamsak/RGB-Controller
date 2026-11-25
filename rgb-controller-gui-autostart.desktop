@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=RGB Controller (tray)
+Comment=Tray icon for rgb-controller
+Exec=rgb-controller-gui --tray
+Icon=rgb-controller
+Terminal=false
+X-GNOME-Autostart-enabled=true

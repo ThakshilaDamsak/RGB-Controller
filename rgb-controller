@@ -1,0 +1,1519 @@
+#!/usr/bin/env python3
+"""rgb-controller: event-driven OpenRGB profile switcher. No polling, 0% idle CPU.
+
+Everything is driven by D-Bus signals, pidfd wakeups, inotify or one-shot timers.
+When nothing happens the process sleeps in the GLib main loop (epoll).
+
+AC power is a hard gate: on battery -> PROFILE_BATTERY and every other source is paused.
+While plugged in, the FIRST source in PRIORITY that has an opinion wins:
+
+  pin       manual override from the GUI / `rgbctl pin` (optionally expires)
+  loading   desktop progress bars + terminal package jobs        -> PROFILE_LOADING
+  gaming    `game-rgb start|stop|run` (Lutris hooks)             -> PROFILE_GAMING
+  media     Spotify -> PROFILE_SPOTIFY, other players            -> PROFILE_OTHER_MEDIA (+ per-player rules)
+  schedule  time windows ("Off from 23:30 to 07:00")             -> whatever the window says
+  power     power-profiles-daemon mode: balanced/power-saver     -> PROFILE_DEFAULT / PROFILE_POWER_SAVER
+                                        performance            -> PROFILE_PERFORMANCE
+  (nothing has an opinion)                                       -> PROFILE_DEFAULT
+
+Reorder or remove entries in PRIORITY to change the behaviour. Edit the CONFIG block below, or
+(recommended) put overrides in ~/.config/rgb-controller/config.toml; the daemon watches that file
+with inotify and applies changes instantly. The GUI writes that file for you.
+
+Adding a trigger, e.g. "camera in use":
+
+    class CameraSource(Source):
+        name = "camera"
+        def start(self):  ...subscribe to something, call self.ctl.schedule() on change
+        def stop(self):   ...unsubscribe
+        def wanted(self): return PROFILE_CAMERA if self.active else None
+
+    SOURCES["camera"] = CameraSource      # then add "camera" to PRIORITY
+
+External processes talk to the daemon over the session bus (org.rgbcontroller.Daemon):
+Hold/Release, Pin/Unpin, Reevaluate, Reload, Status, Config, History and the signals
+StateChanged / Log. Use the `rgbctl` and `game-rgb` helper scripts rather than calling it by hand.
+"""
+
+import collections
+import copy
+import datetime
+import hashlib
+import json
+import logging
+import os
+import signal
+import sys
+import time
+import tomllib
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+# ═══════════════════════════════ CONFIG ═══════════════════════════════
+# Everything in this block can be overridden from ~/.config/rgb-controller/config.toml
+# (same names, lower case):   profile_spotify = "Purple"
+
+# Profile names exactly as saved in OpenRGB (`openrgb --save-profile NAME`).
+PROFILE_DEFAULT = "Default"          # PPD balanced, and the fallback when nothing else applies
+PROFILE_PERFORMANCE = "Performance"  # PPD performance
+PROFILE_POWER_SAVER = "Default"      # PPD power-saver while plugged in
+PROFILE_BATTERY = "Off"              # unplugged (saves battery)
+PROFILE_LOADING = "Loading"          # progress bars, pacman/paru/mirror jobs
+PROFILE_GAMING = "Gaming"            # game-rgb start
+PROFILE_SPOTIFY = "Rainbow"          # Spotify playing
+PROFILE_OTHER_MEDIA = "Off"          # any other MPRIS player playing (video, browser, mpv...)
+
+# Trigger order below AC power, highest priority first. Leave a name out to disable that trigger.
+PRIORITY = ("pin", "loading", "gaming", "media", "schedule", "power")
+
+# How profiles get applied. Use ("openrgb", "--client", "localhost:6742") if you keep an OpenRGB
+# server running (much faster than a full device scan per call).
+OPENRGB_CMD = ("openrgb",)
+OPENRGB_TIMEOUT_S = 30
+RETRY_DELAYS_S = (2, 5, 15)          # retry schedule when openrgb fails (USB not ready, ...)
+
+# Media
+SPOTIFY_HINTS = ("spotify",)         # substrings of the MPRIS bus name that mean "Spotify"
+SPOTIFY_BEATS_OTHER_MEDIA = True     # both playing: True -> Spotify profile, False -> other-media profile
+IGNORE_PLAYERS = ()                  # MPRIS name substrings to ignore, e.g. ("kdeconnect",)
+MEDIA_RULES = ()                     # per-player profiles, first match wins and beats the Spotify rule:
+#                                      ({"match": "vlc", "profile": "Vomit"}, {"match": "mpv", "profile": "Off"})
+
+# Schedule: windows that apply while the `schedule` source is enabled. Days are 0=Mon ... 6=Sun
+# (the day the window STARTS on); a window may cross midnight. First matching window wins.
+SCHEDULE = ()                        # ({"name": "Night", "start": "23:30", "end": "07:00", "days": [0,1,2,3,4,5,6], "profile": "Off"},)
+
+# Timing (all one-shot timers, never periodic)
+DEBOUNCE_MS = 400                    # coalesce bursts of events into one decision
+LOADING_GRACE_MS = 1500              # ignore progress shorter than this (no flicker for tiny jobs)
+LOADING_LINGER_MS = 3000             # keep Loading this long after the last job (back-to-back jobs)
+RESUME_SETTLE_MS = 2500              # after suspend: let USB/OpenRGB come back before touching LEDs
+PROGRESS_STALE_S = 900               # drop a progress item nobody has updated for this long
+HOLD_MAX_HOURS = 12.0                # safety net: a game-rgb hold without a pid expires after this (0 = never)
+MEDIA_OFF_DELAY_MS = 30000           # wait this long after non-Spotify media starts before turning lights off (0 = instant)
+
+# Progress sources for the Loading state
+WATCH_JOBVIEW = True                 # KDE job views (Dolphin copies, Discover, KIO...)
+WATCH_LAUNCHER = True                # taskbar progress (com.canonical.Unity.LauncherEntry: browsers, installers...)
+WATCH_NOTIFICATIONS = True           # notifications carrying a progress "value" hint
+IGNORE_NOTIFICATION_APPS = ()        # app_name values to ignore, e.g. ("Spotify",)
+# ═════════════════════════════ END CONFIG ═════════════════════════════
+
+_TUNABLES = sorted(k for k, v in list(globals().items()) if k.isupper() and not k.startswith("_"))
+_DEFAULTS = {k: copy.deepcopy(globals()[k]) for k in _TUNABLES}
+
+
+class _Ring(logging.Handler):
+    """Keeps the last lines for the GUI's log tab and forwards new ones as a D-Bus signal."""
+
+    def __init__(self):
+        super().__init__()
+        self.lines = collections.deque(maxlen=300)
+        self.sink = None
+
+    def emit(self, record):
+        line = f"{time.strftime('%H:%M:%S', time.localtime(record.created))} {record.getMessage()}"
+        self.lines.append(line)
+        if self.sink:
+            try:
+                self.sink(line)
+            except Exception:
+                pass
+
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+log = logging.getLogger("rgb-controller")
+ring = _Ring()
+log.addHandler(ring)
+
+
+def config_path():
+    return os.environ.get("RGB_CONTROLLER_CONFIG") or os.path.join(
+        GLib.get_user_config_dir(), "rgb-controller", "config.toml"
+    )
+
+
+def _coerce(default, val):
+    if isinstance(default, bool):
+        if isinstance(val, bool):
+            return val
+    elif isinstance(default, int):
+        if isinstance(val, int) and not isinstance(val, bool):
+            return val
+    elif isinstance(default, float):
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return float(val)
+    elif isinstance(default, str):
+        if isinstance(val, str):
+            return val
+    elif isinstance(default, tuple):
+        if isinstance(val, list) and all(isinstance(x, (str, int, dict)) and not isinstance(x, bool) for x in val):
+            return tuple(val)
+    raise ValueError(f"expected {type(default).__name__}")
+
+
+_config_hash = None
+
+
+def load_config():
+    """(Re)load overrides on top of the built-in defaults. Returns True if anything was (re)applied.
+    A broken file never takes the daemon down: the previous settings stay in force."""
+    global _config_hash
+    path = config_path()
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        raw = b""
+    except OSError as e:
+        log.error("config: cannot read %s: %s", path, e)
+        return False
+    digest = hashlib.sha1(raw).hexdigest()
+    if digest == _config_hash:
+        return False
+    try:
+        data = tomllib.loads(raw.decode("utf-8")) if raw.strip() else {}
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        log.error("config: %s is not valid TOML (%s), keeping the previous settings", path, e)
+        _config_hash = digest  # do not spam the same error on every inotify event
+        return False
+    _config_hash = digest
+    g = globals()
+    for k, v in _DEFAULTS.items():
+        g[k] = copy.deepcopy(v)
+    for key, val in data.items():
+        k = key.upper()
+        if k not in _DEFAULTS:
+            log.warning("config: unknown key %r ignored", key)
+            continue
+        try:
+            g[k] = _coerce(_DEFAULTS[k], val)
+        except ValueError as e:
+            log.warning("config: %s: %s, using the default", key, e)
+    if "ac" in PRIORITY:
+        g["PRIORITY"] = tuple(n for n in PRIORITY if n != "ac")
+    if raw.strip():
+        log.info("config: loaded %s", path)
+    return True
+
+
+def ok_profile(name):
+    """Profile names go to `openrgb --profile NAME` as one argv item; refuse anything option-shaped."""
+    return isinstance(name, str) and 0 < len(name) <= 128 and not name.startswith("-") and "\0" not in name
+
+
+load_config()
+
+BUS_NAME = "org.rgbcontroller.Daemon"
+OBJ_PATH = "/org/rgbcontroller/Daemon"
+IFACE = "org.rgbcontroller.Daemon1"
+INTROSPECTION = f"""
+<node>
+  <interface name="{IFACE}">
+    <method name="Hold">
+      <arg type="s" name="source" direction="in"/>
+      <arg type="s" name="token" direction="in"/>
+      <arg type="u" name="pid" direction="in"/>
+    </method>
+    <method name="Release">
+      <arg type="s" name="source" direction="in"/>
+      <arg type="s" name="token" direction="in"/>
+    </method>
+    <method name="Pin">
+      <arg type="s" name="profile" direction="in"/>
+      <arg type="i" name="seconds" direction="in"/>
+    </method>
+    <method name="Unpin"/>
+    <method name="Reevaluate"/>
+    <method name="Reload"/>
+    <method name="Status"><arg type="s" name="json" direction="out"/></method>
+    <method name="Config"><arg type="s" name="json" direction="out"/></method>
+    <method name="History"><arg type="s" name="json" direction="out"/></method>
+    <signal name="StateChanged"><arg type="s" name="json"/></signal>
+    <signal name="Log"><arg type="s" name="line"/></signal>
+  </interface>
+</node>
+"""
+
+UPOWER = "org.freedesktop.UPower"
+UPOWER_PATH = "/org/freedesktop/UPower"
+PROPS = "org.freedesktop.DBus.Properties"
+MPRIS_NS = "org.mpris.MediaPlayer2"
+MPRIS_PREFIX = MPRIS_NS + "."
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"
+NOTIFICATIONS = "org.freedesktop.Notifications"
+MAX_ITEMS = 256
+
+
+# ═══════════════════════════════ plumbing ═══════════════════════════════
+class Timer:
+    """One-shot GLib timeout. start() keeps an already-pending deadline (coalescing)."""
+
+    def __init__(self, fn):
+        self.fn = fn
+        self.id = 0
+
+    @property
+    def pending(self):
+        return self.id != 0
+
+    def start(self, ms):
+        if not self.id:
+            self.id = GLib.timeout_add(int(min(ms, 2**31 - 1)), self._fire)
+
+    def restart(self, ms):
+        self.cancel()
+        self.start(ms)
+
+    def cancel(self):
+        if self.id:
+            GLib.source_remove(self.id)
+            self.id = 0
+
+    def _fire(self):
+        self.id = 0
+        self.fn()
+        return GLib.SOURCE_REMOVE
+
+
+def sysfs_on_battery():
+    """Fallback when UPower is unavailable: battery present and no mains supply online."""
+    base = "/sys/class/power_supply"
+    has_battery = online = False
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return False
+
+    def read(path):
+        try:
+            with open(path) as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+
+    for n in names:
+        kind = read(f"{base}/{n}/type")
+        if kind == "Battery":
+            has_battery = True
+        elif kind in ("Mains", "USB_C", "USB_PD", "USB_PD_DRP") and read(f"{base}/{n}/online") == "1":
+            online = True
+    return has_battery and not online
+
+
+class ProfileRunner:
+    """Runs `openrgb --profile X` safely: one process at a time, latest request wins,
+    bounded retries, nothing spawned while the machine is suspended."""
+
+    def __init__(self):
+        self.wanted = None
+        self.applied = None
+        self.proc = None
+        self.gen = 0               # bumped on cancel so stale completions are ignored
+        self.failures = 0
+        self.gave_up = False
+        self.suspended = False
+        self.on_change = None
+        self.kill_timer = Timer(self._on_timeout)
+        self.retry_timer = Timer(self._pump)
+
+    def _notify(self):
+        if self.on_change:
+            self.on_change()
+
+    def request(self, profile):
+        if not ok_profile(profile):
+            log.warning("refusing invalid profile name %r", profile)
+            return
+        if profile != self.wanted:
+            self.wanted = profile
+            self.failures = 0
+            self.gave_up = False
+            self.retry_timer.cancel()
+        self._pump()
+
+    def invalidate(self):
+        """Forget what the LEDs are doing (devices reset on suspend) so the next request re-applies."""
+        self.applied = None
+        self.failures = 0
+        self.gave_up = False
+        self.retry_timer.cancel()
+
+    def hold_off(self):
+        """System is going to sleep: stop touching USB devices."""
+        self.suspended = True
+        self.gen += 1
+        self.retry_timer.cancel()
+        self.applied = None
+        if self.proc:
+            try:
+                self.proc.send_signal(signal.SIGTERM)
+            except GLib.Error:
+                pass
+
+    def resume(self):
+        self.suspended = False
+        self.invalidate()
+
+    def _pump(self):
+        if (
+            self.suspended
+            or self.proc
+            or self.gave_up
+            or self.retry_timer.pending
+            or self.wanted is None
+            or self.wanted == self.applied
+        ):
+            return
+        profile = self.wanted
+        argv = [*OPENRGB_CMD, "--profile", profile]
+        log.info("openrgb: applying %r", profile)
+        try:
+            self.proc = Gio.Subprocess.new(
+                argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE
+            )
+        except GLib.Error as e:
+            self._failed(profile, e.message)
+            return
+        self.kill_timer.restart(OPENRGB_TIMEOUT_S * 1000)
+        self.proc.communicate_utf8_async(None, None, self._done, (profile, self.gen))
+
+    def _done(self, proc, res, data):
+        profile, gen = data
+        self.kill_timer.cancel()
+        self.proc = None
+        try:
+            _, out, _ = proc.communicate_utf8_finish(res)
+        except GLib.Error as e:
+            out = e.message
+        if gen == self.gen:
+            if proc.get_successful():
+                self.applied = profile
+                self.failures = 0
+                log.info("openrgb: %r applied", profile)
+                self._notify()
+            else:
+                lines = (out or "").strip().splitlines()
+                self._failed(profile, lines[-1] if lines else "no output")
+        self._pump()
+
+    def _failed(self, profile, why):
+        log.warning("openrgb: %r failed (%s)", profile, why)
+        if profile != self.wanted:
+            self.failures = 0
+            return
+        self.failures += 1
+        if self.failures > len(RETRY_DELAYS_S):
+            log.error("openrgb: giving up on %r until the next state change", profile)
+            self.gave_up = True
+            self._notify()
+            return
+        self.retry_timer.start(RETRY_DELAYS_S[self.failures - 1] * 1000)
+
+    def _on_timeout(self):
+        if self.proc:
+            log.warning("openrgb: no answer after %ds, killing it", OPENRGB_TIMEOUT_S)
+            self.proc.force_exit()
+
+
+# ═══════════════════════════════ sources ═══════════════════════════════
+class Source:
+    """A trigger. Subclasses implement wanted(); start()/stop() subscribe/unsubscribe.
+    Sources keep their own state across stop()/start() (pins and holds survive being paused)."""
+
+    name = "source"
+    gate = False  # gate sources are always on, outrank everything and pause everything below them
+
+    def __init__(self, ctl):
+        self.ctl = ctl
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def resync(self):
+        pass
+
+    def reconfigure(self):
+        """Config file changed while running."""
+
+    def wanted(self):
+        return None
+
+    def describe(self):
+        return {}
+
+    def hold(self, token, pid):
+        raise KeyError(f"{self.name} does not take holds")
+
+    def release(self, token):
+        raise KeyError(f"{self.name} does not take holds")
+
+
+class ACSource(Source):
+    """Mains/battery via UPower's OnBattery property (signal driven, sysfs fallback)."""
+
+    name = "ac"
+    gate = True
+
+    def __init__(self, ctl):
+        super().__init__(ctl)
+        self.on_battery = False
+        self.sub = 0
+
+    def start(self):
+        if self.ctl.system:
+            self.sub = self.ctl.system.signal_subscribe(
+                UPOWER, PROPS, "PropertiesChanged", UPOWER_PATH, UPOWER,
+                Gio.DBusSignalFlags.NONE, self._on_props,
+            )
+        self.resync()
+
+    def _on_props(self, conn, sender, path, iface, signal_name, params, *_):
+        _, changed, invalidated = params.unpack()
+        if "OnBattery" in changed:
+            self._set(bool(changed["OnBattery"]))
+        elif "OnBattery" in invalidated:
+            self.resync()
+
+    def resync(self):
+        """Ask for the current value (used at start and after every resume)."""
+        if not self.ctl.system:
+            self._set(sysfs_on_battery())
+            return
+        self.ctl.system.call(
+            UPOWER, UPOWER_PATH, PROPS, "Get",
+            GLib.Variant("(ss)", (UPOWER, "OnBattery")), GLib.VariantType("(v)"),
+            Gio.DBusCallFlags.NONE, 3000, None, self._got,
+        )
+
+    def _got(self, conn, res, *_):
+        try:
+            val = bool(conn.call_finish(res).unpack()[0])
+        except GLib.Error as e:
+            log.warning("ac: UPower unavailable (%s), using sysfs", e.message)
+            val = sysfs_on_battery()
+        self._set(val)
+
+    def _set(self, val):
+        if val != self.on_battery:
+            self.on_battery = val
+            log.info("ac: %s", "UNPLUGGED" if val else "plugged in")
+            self.ctl.on_ac_changed()
+
+    def wanted(self):
+        return PROFILE_BATTERY if self.on_battery else None
+
+    def describe(self):
+        return {"on_battery": self.on_battery}
+
+
+class HoldSource(Source):
+    """Driven by Hold/Release calls from other processes. A hold with a pid dies with that pid
+    (pidfd wakeup), a hold without one dies after HOLD_MAX_HOURS, so a crashed pacman or a
+    Lutris that never ran its exit script can never leave the lights stuck."""
+
+    def __init__(self, ctl):
+        super().__init__(ctl)
+        self.holds = {}  # token -> {"fd": int, "src": int, "ttl": int}
+
+    def hold(self, token, pid=0):
+        if not token or len(token) > 128 or (token not in self.holds and len(self.holds) >= 64):
+            raise ValueError("bad or too many tokens")
+        self.release(token)
+        entry = {"fd": -1, "src": 0, "ttl": 0}
+        if pid > 0:
+            try:
+                entry["fd"] = os.pidfd_open(pid)
+            except ProcessLookupError:
+                log.info("%s: hold %r ignored, pid %d already gone", self.name, token, pid)
+                return
+            except (AttributeError, OSError) as e:
+                log.debug("%s: no pidfd (%s), relying on explicit release", self.name, e)
+            if entry["fd"] >= 0:
+                entry["src"] = GLib.unix_fd_add_full(
+                    GLib.PRIORITY_DEFAULT, entry["fd"], GLib.IOCondition.IN, self._pid_exited, token
+                )
+        if entry["fd"] < 0 and HOLD_MAX_HOURS > 0:
+            entry["ttl"] = GLib.timeout_add_seconds(int(HOLD_MAX_HOURS * 3600), self._expired, token)
+        self.holds[token] = entry
+        log.info("%s: hold %r", self.name, token)
+        self.changed()
+
+    def release(self, token):
+        if token == "*":
+            for t in list(self.holds):
+                self.release(t)
+            return
+        entry = self.holds.pop(token, None)
+        if not entry:
+            return
+        if entry["src"]:
+            GLib.source_remove(entry["src"])
+        if entry["ttl"]:
+            GLib.source_remove(entry["ttl"])
+        if entry["fd"] >= 0:
+            os.close(entry["fd"])
+        log.info("%s: release %r", self.name, token)
+        self.changed()
+
+    def _pid_exited(self, fd, condition, token):
+        entry = self.holds.get(token)
+        if entry:
+            entry["src"] = 0  # removed by returning SOURCE_REMOVE
+        self.release(token)
+        return GLib.SOURCE_REMOVE
+
+    def _expired(self, token):
+        entry = self.holds.get(token)
+        if entry:
+            entry["ttl"] = 0
+        log.warning("%s: hold %r expired after %sh without a release", self.name, token, HOLD_MAX_HOURS)
+        self.release(token)
+        return GLib.SOURCE_REMOVE
+
+    def changed(self):
+        self.ctl.schedule()
+
+    def describe(self):
+        return {"holds": sorted(self.holds)}
+
+
+class GamingSource(HoldSource):
+    name = "gaming"
+
+    def wanted(self):
+        return PROFILE_GAMING if self.holds else None
+
+
+class PinSource(Source):
+    """Manual override ("party mode for 30 minutes"). Optional expiry on a one-shot wall-clock timer."""
+
+    name = "pin"
+
+    def __init__(self, ctl):
+        super().__init__(ctl)
+        self.profile = None
+        self.deadline = 0.0
+        self.running = False
+        self.timer = Timer(self._expire)
+
+    def pin(self, profile, seconds):
+        if not ok_profile(profile):
+            raise ValueError("bad profile name")
+        seconds = max(0, min(int(seconds), 7 * 24 * 3600))
+        self.profile = profile
+        self.deadline = time.time() + seconds if seconds else 0.0
+        log.info("pin: %r %s", profile, f"for {seconds}s" if seconds else "until unpinned")
+        self._arm()
+        self.ctl.schedule(immediate=True)
+
+    def unpin(self):
+        if self.profile:
+            log.info("pin: released")
+        self.profile = None
+        self.deadline = 0.0
+        self.timer.cancel()
+        self.ctl.schedule(immediate=True)
+
+    def _arm(self):
+        self.timer.cancel()
+        if self.profile and self.deadline and self.running:
+            self.timer.start(max(250, int((self.deadline - time.time()) * 1000) + 250))
+
+    def _expire(self):
+        if self.deadline and time.time() >= self.deadline - 0.5:
+            log.info("pin: expired")
+            self.unpin()
+        else:
+            self._arm()
+
+    def start(self):
+        self.running = True
+        if self.profile and self.deadline and time.time() >= self.deadline:
+            self.profile, self.deadline = None, 0.0
+        self._arm()
+
+    def stop(self):
+        self.running = False
+        self.timer.cancel()
+
+    def wanted(self):
+        return self.profile if self.running else None
+
+    def describe(self):
+        left = max(0, int(self.deadline - time.time())) if self.deadline else None
+        return {"profile": self.profile, "remaining_s": left}
+
+
+class MediaSource(Source):
+    """MPRIS players: Spotify -> PROFILE_SPOTIFY, anything else playing -> PROFILE_OTHER_MEDIA,
+    MEDIA_RULES can map specific players to their own profile.
+
+    Non-Spotify media triggers PROFILE_OTHER_MEDIA after MEDIA_OFF_DELAY_MS (default 30s).
+    This prevents lights from turning off when scrolling past videos on media-heavy sites.
+    Spotify is immediate and ignores this delay.
+    """
+
+    name = "media"
+
+    def __init__(self, ctl):
+        super().__init__(ctl)
+        self.players = {}  # unique bus name -> {"name": well-known name, "status": str|None}
+        self.subs = []
+        self.off_timer = Timer(self._off_delay_expired)
+        self.off_delay_state = "idle"  # "idle" | "waiting" | "expired"
+
+    def start(self):
+        bus = self.ctl.session
+        self.subs = [
+            bus.signal_subscribe(
+                "org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+                "/org/freedesktop/DBus", MPRIS_NS, Gio.DBusSignalFlags.MATCH_ARG0_NAMESPACE,
+                self._on_owner,
+            ),
+            bus.signal_subscribe(
+                None, PROPS, "PropertiesChanged", MPRIS_PATH, MPRIS_PLAYER,
+                Gio.DBusSignalFlags.NONE, self._on_props,
+            ),
+        ]
+        self.resync()
+
+    def stop(self):
+        for sid in self.subs:
+            self.ctl.session.signal_unsubscribe(sid)
+        self.subs = []
+        self.players.clear()
+        self.off_timer.cancel()
+        self.off_delay_state = "idle"
+
+    def reconfigure(self):
+        pass
+
+    def resync(self):
+        self.ctl.session.call(
+            "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ListNames",
+            None, GLib.VariantType("(as)"), Gio.DBusCallFlags.NONE, 2000, None, self._got_names,
+        )
+
+    def _got_names(self, conn, res, *_):
+        try:
+            names = conn.call_finish(res).unpack()[0]
+        except GLib.Error:
+            return
+        for n in names:
+            if n.startswith(MPRIS_PREFIX):
+                conn.call(
+                    "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                    "GetNameOwner", GLib.Variant("(s)", (n,)), GLib.VariantType("(s)"),
+                    Gio.DBusCallFlags.NONE, 2000, None, self._got_owner, n,
+                )
+
+    def _got_owner(self, conn, res, name):
+        try:
+            owner = conn.call_finish(res).unpack()[0]
+        except GLib.Error:
+            return
+        if not self.subs:
+            return
+        self.players.setdefault(owner, {"name": name, "status": None})["name"] = name
+        self._query_status(owner)
+
+    def _query_status(self, unique):
+        if not self.subs:
+            return
+        self.ctl.session.call(
+            unique, MPRIS_PATH, PROPS, "Get",
+            GLib.Variant("(ss)", (MPRIS_PLAYER, "PlaybackStatus")), GLib.VariantType("(v)"),
+            Gio.DBusCallFlags.NONE, 2000, None, self._got_status, unique,
+        )
+
+    def _got_status(self, conn, res, unique):
+        try:
+            status = conn.call_finish(res).unpack()[0]
+        except GLib.Error:
+            return
+        if unique in self.players:
+            self.players[unique]["status"] = status
+            self.ctl.schedule()
+
+    def _on_owner(self, conn, sender, path, iface, signal_name, params, *_):
+        name, old, new = params.unpack()
+        if not name.startswith(MPRIS_PREFIX):
+            return
+        if old:
+            self.players.pop(old, None)
+        if new:
+            self.players[new] = {"name": name, "status": None}
+            self._query_status(new)
+        self.ctl.schedule()
+
+    def _on_props(self, conn, sender, path, iface, signal_name, params, *_):
+        _, changed, invalidated = params.unpack()
+        if "PlaybackStatus" not in changed and "PlaybackStatus" not in invalidated:
+            return
+        player = self.players.get(sender)
+        if player is None:
+            self.resync()  # a player we never saw appear
+        elif "PlaybackStatus" in changed:
+            player["status"] = changed["PlaybackStatus"]
+            self.ctl.schedule()
+        else:
+            self._query_status(sender)
+
+    @staticmethod
+    def _short(name):
+        return name[len(MPRIS_PREFIX):].lower()
+
+    def _is_spotify(self, name):
+        return any(h.lower() in self._short(name) for h in SPOTIFY_HINTS)
+
+    def _playing(self):
+        return [
+            p["name"] for p in self.players.values()
+            if p["status"] == "Playing" and not any(i.lower() in p["name"].lower() for i in IGNORE_PLAYERS)
+        ]
+
+    def _has_spotify(self):
+        return any(self._is_spotify(n) for n in self._playing())
+
+    def _has_other_media(self):
+        return any(not self._is_spotify(n) for n in self._playing())
+
+    def _off_delay_expired(self):
+        self.off_delay_state = "expired"
+        self.ctl.schedule()
+
+    def wanted(self):
+        playing = self._playing()
+        for rule in MEDIA_RULES:
+            try:
+                needle, profile = str(rule["match"]).lower(), rule["profile"]
+            except (KeyError, TypeError):
+                continue
+            if needle and ok_profile(profile) and any(needle in self._short(n) for n in playing):
+                self.off_timer.cancel()
+                self.off_delay_state = "idle"
+                return profile
+
+        spotify = self._has_spotify()
+        other = self._has_other_media()
+
+        if spotify and (SPOTIFY_BEATS_OTHER_MEDIA or not other):
+            self.off_timer.cancel()
+            self.off_delay_state = "idle"
+            return PROFILE_SPOTIFY
+
+        if other:
+            if MEDIA_OFF_DELAY_MS <= 0:
+                self.off_delay_state = "idle"
+                return PROFILE_OTHER_MEDIA
+            if self.off_delay_state == "idle":
+                self.off_delay_state = "waiting"
+                self.off_timer.start(MEDIA_OFF_DELAY_MS)
+            if self.off_delay_state == "expired":
+                return PROFILE_OTHER_MEDIA
+            return None  # waiting for timer
+
+        # no other media playing
+        self.off_timer.cancel()
+        self.off_delay_state = "idle"
+        if spotify:
+            return PROFILE_SPOTIFY
+        return None
+
+    def describe(self):
+        return {p["name"][len(MPRIS_PREFIX):]: p["status"] for p in self.players.values()}
+
+
+class ScheduleSource(Source):
+    """Time windows. One one-shot timer aimed at the next window boundary; no ticking."""
+
+    name = "schedule"
+
+    def __init__(self, ctl):
+        super().__init__(ctl)
+        self.rules = []
+        self.active = None
+        self.running = False
+        self.timer = Timer(self._tick)
+
+    def _parse(self):
+        rules = []
+        for r in SCHEDULE:
+            try:
+                sh, sm = (int(x) for x in str(r["start"]).split(":"))
+                eh, em = (int(x) for x in str(r["end"]).split(":"))
+                if not (0 <= sh < 24 and 0 <= eh < 24 and 0 <= sm < 60 and 0 <= em < 60):
+                    raise ValueError("time out of range")
+                days = {int(d) for d in r.get("days", range(7))} & set(range(7))
+                if not ok_profile(r["profile"]):
+                    raise ValueError("bad profile")
+                rules.append({
+                    "name": str(r.get("name", "")), "profile": r["profile"], "days": days,
+                    "start": datetime.time(sh, sm), "end": datetime.time(eh, em),
+                })
+            except (KeyError, ValueError, TypeError, AttributeError):
+                log.warning("schedule: ignoring bad window %r", r)
+        self.rules = rules
+
+    def _scan(self, now):
+        active = nxt = None
+        today = now.date()
+        for r in self.rules:
+            for off in range(-1, 9):
+                d = today + datetime.timedelta(days=off)
+                if d.weekday() not in r["days"]:
+                    continue
+                s = datetime.datetime.combine(d, r["start"])
+                e = datetime.datetime.combine(d, r["end"])
+                if e <= s:
+                    e += datetime.timedelta(days=1)
+                if active is None and s <= now < e:
+                    active = r["profile"]
+                for b in (s, e):
+                    if b > now and (nxt is None or b < nxt):
+                        nxt = b
+        return active, nxt
+
+    def _refresh(self):
+        now = datetime.datetime.now()
+        self.active, nxt = self._scan(now)
+        self.timer.cancel()
+        if nxt and self.running:
+            self.timer.start(max(1000, int((nxt - now).total_seconds() * 1000) + 500))
+
+    def _tick(self):
+        before = self.active
+        self._refresh()
+        if self.active != before:
+            log.info("schedule: %s", self.active or "no window active")
+            self.ctl.schedule()
+
+    def start(self):
+        self.running = True
+        self._parse()
+        self._refresh()
+
+    def stop(self):
+        self.running = False
+        self.timer.cancel()
+
+    def reconfigure(self):
+        if self.running:
+            self._parse()
+            self._refresh()
+
+    def wanted(self):
+        return self.active if self.running else None
+
+    def describe(self):
+        return {"windows": len(self.rules), "active": self.active}
+
+
+class PowerProfileSource(Source):
+    """power-profiles-daemon: the lowest-priority source, it defines what 'idle' looks like."""
+
+    name = "power"
+    SERVICES = (
+        ("org.freedesktop.UPower.PowerProfiles", "/org/freedesktop/UPower/PowerProfiles"),
+        ("net.hadess.PowerProfiles", "/net/hadess/PowerProfiles"),
+    )
+
+    def __init__(self, ctl):
+        super().__init__(ctl)
+        self.mode = None
+        self.subs = []
+        self.watches = []
+        self.up = set()   # which of SERVICES currently have an owner (new and legacy names may both exist)
+
+    def start(self):
+        bus = self.ctl.system
+        if not bus:
+            return
+        for svc, path in self.SERVICES:
+            self.subs.append(bus.signal_subscribe(
+                None, PROPS, "PropertiesChanged", None, svc, Gio.DBusSignalFlags.NONE, self._on_props,
+            ))
+            self.watches.append(Gio.bus_watch_name_on_connection(
+                bus, svc, Gio.BusNameWatcherFlags.NONE,
+                lambda conn, name, owner, p=path: self._appeared(name, p),
+                lambda conn, name: self._vanished(name),
+            ))
+
+    def stop(self):
+        bus = self.ctl.system
+        for sid in self.subs:
+            bus.signal_unsubscribe(sid)
+        for wid in self.watches:
+            Gio.bus_unwatch_name(wid)
+        self.subs, self.watches, self.mode = [], [], None
+        self.up.clear()
+
+    def _appeared(self, svc, path):
+        self.up.add(svc)
+        self._query(svc, path)
+
+    def _vanished(self, svc):
+        self.up.discard(svc)
+        if not self.up:  # only forget the mode when no variant of the service is left
+            self._set(None)
+
+    def _query(self, svc, path):
+        self.ctl.system.call(
+            svc, path, PROPS, "Get", GLib.Variant("(ss)", (svc, "ActiveProfile")), GLib.VariantType("(v)"),
+            Gio.DBusCallFlags.NONE, 3000, None, self._got,
+        )
+
+    def _got(self, conn, res, *_):
+        try:
+            self._set(conn.call_finish(res).unpack()[0])
+        except GLib.Error as e:
+            log.debug("power: %s", e.message)
+
+    def _on_props(self, conn, sender, path, iface, signal_name, params, *_):
+        _, changed, _inv = params.unpack()
+        if "ActiveProfile" in changed:
+            self._set(changed["ActiveProfile"])
+
+    def _set(self, mode):
+        if mode != self.mode:
+            self.mode = mode
+            log.info("power: profile is %s", mode or "unknown")
+            self.ctl.schedule()
+
+    def wanted(self):
+        return {
+            "balanced": PROFILE_DEFAULT,
+            "performance": PROFILE_PERFORMANCE,
+            "power-saver": PROFILE_POWER_SAVER,
+        }.get(self.mode)
+
+    def describe(self):
+        return {"mode": self.mode}
+
+
+class LoadingSource(HoldSource):
+    """Loading = any desktop progress bar OR any 'loading' hold (Fish wrapper for pacman/paru/...).
+
+    Progress bars are discovered by a D-Bus *monitor* connection that only receives:
+      - method calls on /JobViewServer/*   (KDE JobViewV2/V3: any call = job running, terminate = done)
+      - com.canonical.Unity.LauncherEntry.Update signals (taskbar progress)
+      - org.freedesktop.Notifications.Notify calls carrying a `value` progress hint
+    The monitor is closed while the machine is on battery. Active jobs re-announce themselves
+    with their next update call after monitoring resumes."""
+
+    name = "loading"
+
+    def __init__(self, ctl):
+        super().__init__(ctl)
+        self.items = {}      # key -> (sender, last_seen)
+        self.watches = {}    # sender unique name -> bus name watch id
+        self.pending = {}    # (caller, serial) -> caller, for Notify calls awaiting their reply
+        self.mon = None
+        self.rules = ()
+        self.notif_watch = 0
+        self.confirmed = False
+        self.grace = Timer(self._confirm)
+        self.linger = Timer(self._unconfirm)
+        self.gc = Timer(self._gc)
+
+    # --- lifecycle -------------------------------------------------------
+    @staticmethod
+    def _rules():
+        rules = []
+        if WATCH_JOBVIEW:
+            rules.append("type='method_call',path_namespace='/JobViewServer'")
+        if WATCH_LAUNCHER:
+            rules.append("type='signal',interface='com.canonical.Unity.LauncherEntry',member='Update'")
+        if WATCH_NOTIFICATIONS:
+            rules += [
+                f"type='method_call',interface='{NOTIFICATIONS}',member='Notify'",
+                f"type='method_call',interface='{NOTIFICATIONS}',member='CloseNotification'",
+                f"type='signal',interface='{NOTIFICATIONS}',member='NotificationClosed'",
+                f"type='method_return',sender='{NOTIFICATIONS}'",
+            ]
+        return tuple(rules)
+
+    def start(self):
+        rules = self._rules()
+        if not rules or self.mon:  # an empty rule list would mean "everything", never do that
+            return
+        try:
+            addr = Gio.dbus_address_get_for_bus_sync(Gio.BusType.SESSION, None)
+            conn = Gio.DBusConnection.new_for_address_sync(
+                addr,
+                Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+                None, None,
+            )
+            conn.add_filter(self._filter, None)
+            conn.call_sync(
+                "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus.Monitoring",
+                "BecomeMonitor", GLib.Variant("(asu)", (list(rules), 0)), None,
+                Gio.DBusCallFlags.NONE, 3000, None,
+            )
+        except GLib.Error as e:
+            log.warning("loading: cannot monitor the session bus (%s); only explicit holds will work", e.message)
+            return
+        self.mon = conn
+        self.rules = rules
+        if WATCH_NOTIFICATIONS:
+            self.notif_watch = Gio.bus_watch_name_on_connection(
+                self.ctl.session, NOTIFICATIONS, Gio.BusNameWatcherFlags.NONE, None, self._notif_gone
+            )
+        log.info("loading: monitoring progress bars")
+
+    def stop(self):
+        mon, self.mon = self.mon, None
+        if mon:
+            try:
+                mon.close_sync(None)
+            except GLib.Error:
+                pass
+        if self.notif_watch:
+            Gio.bus_unwatch_name(self.notif_watch)
+            self.notif_watch = 0
+        for wid in self.watches.values():
+            Gio.bus_unwatch_name(wid)
+        self.watches.clear()
+        self.items.clear()
+        self.pending.clear()
+        self.gc.cancel()
+        self.grace.cancel()
+        self.linger.cancel()
+        self.confirmed = False   # progress state is stale once we stop watching; holds are re-evaluated below
+        self._activity()
+
+    def reconfigure(self):
+        if self.mon and self._rules() != self.rules:
+            self.stop()
+            self.start()
+
+    def wanted(self):
+        return PROFILE_LOADING if self.confirmed else None
+
+    def describe(self):
+        return {
+            "confirmed": self.confirmed,
+            "progress": sorted(" ".join(map(str, k)) for k in self.items),
+            "holds": sorted(self.holds),
+        }
+
+    # --- state ------------------------------------------------------------
+    def changed(self):  # called by HoldSource on hold/release
+        self._activity()
+
+    def _activity(self):
+        if self.items or self.holds:
+            self.linger.cancel()
+            if not self.confirmed and not self.grace.pending:
+                self.grace.start(LOADING_GRACE_MS)
+        else:
+            self.grace.cancel()
+            if self.confirmed and not self.linger.pending:
+                self.linger.start(LOADING_LINGER_MS)
+
+    def _confirm(self):
+        if self.items or self.holds:
+            self.confirmed = True
+            log.info("loading: active")
+            self.ctl.schedule()
+
+    def _unconfirm(self):
+        self.confirmed = False
+        log.info("loading: idle")
+        self.ctl.schedule()
+
+    def _set_item(self, key, sender, active):
+        if active:
+            if key not in self.items and len(self.items) >= MAX_ITEMS:
+                return
+            self.items[key] = (sender, time.monotonic())
+            self._watch_sender(sender)
+            if not self.gc.pending:
+                self.gc.start(PROGRESS_STALE_S * 500)
+        elif key in self.items:
+            self._drop(key)
+        self._activity()
+
+    def _drop(self, key):
+        sender = self.items.pop(key)[0]
+        if sender in self.watches and not any(s == sender for s, _ in self.items.values()):
+            Gio.bus_unwatch_name(self.watches.pop(sender))
+
+    def _watch_sender(self, sender):
+        if sender and sender not in self.watches:
+            self.watches[sender] = Gio.bus_watch_name_on_connection(
+                self.ctl.session, sender, Gio.BusNameWatcherFlags.NONE, None, self._sender_gone
+            )
+
+    def _sender_gone(self, conn, name, *_):
+        wid = self.watches.pop(name, None)
+        if wid:
+            Gio.bus_unwatch_name(wid)
+        for k in [k for k, (s, _) in self.items.items() if s == name]:
+            del self.items[k]
+        self._activity()
+
+    def _notif_gone(self, conn, name, *_):
+        self.pending.clear()
+        for k in [k for k in self.items if k[0] == "notif"]:
+            self._drop(k)
+        self._activity()
+
+    def _gc(self):
+        cutoff = time.monotonic() - PROGRESS_STALE_S
+        for k in [k for k, (_, seen) in self.items.items() if seen < cutoff]:
+            log.info("loading: dropping stale progress item %s", k)
+            self._drop(k)
+        self._activity()
+        if self.items:
+            self.gc.start(PROGRESS_STALE_S * 500)
+
+    # --- monitor connection (runs on GDBus' worker thread: parse, then hop to the main loop) ---
+    def _filter(self, conn, msg, incoming, *_):
+        try:
+            if not incoming:
+                return msg  # filters see outgoing traffic too: our own BecomeMonitor call must get out
+            if (
+                msg.get_message_type() in (Gio.DBusMessageType.METHOD_RETURN, Gio.DBusMessageType.ERROR)
+                and msg.get_destination() == conn.get_unique_name()
+            ):
+                return msg  # the answer to our own BecomeMonitor call, everything else is a monitored copy
+            ev = self._parse(msg)
+            if ev:
+                GLib.idle_add(self._dispatch, ev)
+        except Exception:  # never let a parse error kill the worker thread
+            log.exception("loading: bad monitor message")
+        return None  # drop it: a monitor connection must never answer anything
+
+    @staticmethod
+    def _parse(msg):
+        mtype = msg.get_message_type()
+        member = msg.get_member() or ""
+        iface = msg.get_interface() or ""
+        body = msg.get_body()
+        args = body.unpack() if body is not None else ()
+        if mtype == Gio.DBusMessageType.METHOD_CALL:
+            path = msg.get_path() or ""
+            if path.startswith("/JobViewServer/") and iface.startswith("org.kde.JobView"):
+                return ("job", msg.get_sender(), path, member)
+            if iface == NOTIFICATIONS and member == "Notify" and len(args) >= 8:
+                value = args[6].get("value")
+                return ("notify", msg.get_sender(), msg.get_serial(), args[0], args[1], value)
+            if iface == NOTIFICATIONS and member == "CloseNotification" and args:
+                return ("closed", args[0])
+        elif mtype == Gio.DBusMessageType.SIGNAL:
+            if iface == "com.canonical.Unity.LauncherEntry" and member == "Update" and len(args) >= 2:
+                visible = args[1].get("progress-visible")
+                if visible is not None:
+                    return ("launcher", msg.get_sender(), args[0], bool(visible))
+            elif iface == NOTIFICATIONS and member == "NotificationClosed" and args:
+                return ("closed", args[0])
+        elif mtype == Gio.DBusMessageType.METHOD_RETURN:
+            if args and isinstance(args[0], int):
+                return ("reply", msg.get_destination(), msg.get_reply_serial(), args[0])
+        return None
+
+    def _dispatch(self, ev):
+        if self.mon is None:
+            return GLib.SOURCE_REMOVE
+        kind = ev[0]
+        if kind == "job":
+            _, sender, path, member = ev
+            self._set_item(("job", path), sender, member.lower() != "terminate")
+        elif kind == "launcher":
+            _, sender, uri, visible = ev
+            self._set_item(("launcher", sender, uri), sender, visible)
+        elif kind == "notify":
+            _, sender, serial, app, replaces, value = ev
+            active = value is not None and 0 <= value < 100 and app not in IGNORE_NOTIFICATION_APPS
+            if replaces:
+                self._set_item(("notif", replaces), sender, active)
+            elif active:
+                self.pending[(sender, serial)] = sender  # id arrives with the method return
+                while len(self.pending) > 64:
+                    self.pending.pop(next(iter(self.pending)))
+        elif kind == "reply":
+            _, dest, reply_serial, nid = ev
+            sender = self.pending.pop((dest, reply_serial), None)
+            if sender:
+                self._set_item(("notif", nid), sender, True)
+        elif kind == "closed":
+            if ("notif", ev[1]) in self.items:
+                self._set_item(("notif", ev[1]), None, False)
+        return GLib.SOURCE_REMOVE
+
+
+SOURCES = {
+    "ac": ACSource,
+    "pin": PinSource,
+    "loading": LoadingSource,
+    "gaming": GamingSource,
+    "media": MediaSource,
+    "schedule": ScheduleSource,
+    "power": PowerProfileSource,
+}
+
+
+# ═══════════════════════════════ controller ═══════════════════════════════
+class Controller:
+    def __init__(self, loop):
+        self.loop = loop
+        self.session = self.system = None
+        self.runner = ProfileRunner()
+        self.runner.on_change = self.emit_state
+        self.sleeping = False      # between PrepareForSleep(true) and (false)
+        self.settling = False      # resumed, waiting for USB/OpenRGB to come back
+        self.monitoring = False    # False while on battery
+        self.target = None
+        self.reason = "starting"
+        self.last_state = None
+        self.cfg_monitor = None
+        self.running = set()       # non-gate sources currently started
+        self.all = {n: cls(self) for n, cls in SOURCES.items()}
+        self.eval_timer = Timer(self.evaluate)
+        self.settle_timer = Timer(self._after_resume)
+        self.state_timer = Timer(self._emit_state)
+        self.cfg_timer = Timer(self.reload)
+
+    @property
+    def sources(self):
+        """Enabled sources in priority order (ac first, always)."""
+        out = {"ac": self.all["ac"]}
+        for n in PRIORITY:
+            if n in self.all and n not in out:
+                out[n] = self.all[n]
+        return out
+
+    # --- bus plumbing -----------------------------------------------------
+    def connect(self):
+        self.session = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        try:
+            self.system = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        except GLib.Error as e:
+            log.warning("system bus unavailable (%s): AC detection falls back to sysfs, no suspend handling", e.message)
+        node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
+        self.session.register_object(OBJ_PATH, node.interfaces[0], self._on_method, None, None)
+        ring.sink = self._emit_log
+
+    def start(self):
+        if self.system:
+            self.system.signal_subscribe(
+                "org.freedesktop.login1", "org.freedesktop.login1.Manager", "PrepareForSleep",
+                "/org/freedesktop/login1", None, Gio.DBusSignalFlags.NONE,
+                lambda conn, sender, path, iface, sig, params, *_: self.on_sleep(params.unpack()[0]),
+            )
+        self.all["ac"].start()
+        self._watch_config()
+        self.schedule()
+        log.info("rgb-controller ready")
+
+    def _watch_config(self):
+        path = config_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self.cfg_monitor = Gio.File.new_for_path(path).monitor_file(Gio.FileMonitorFlags.WATCH_MOVES, None)
+            self.cfg_monitor.connect("changed", lambda *a: self.cfg_timer.restart(300))
+        except (OSError, GLib.Error) as e:
+            log.warning("config: cannot watch %s (%s); use the Reload call instead", path, e)
+
+    def _emit_log(self, line):
+        if self.session:
+            self.session.emit_signal(None, OBJ_PATH, IFACE, "Log", GLib.Variant("(s)", (line,)))
+
+    def _on_method(self, conn, sender, path, iface, method, params, invocation, *_):
+        try:
+            if method == "Hold":
+                source, token, pid = params.unpack()
+                self.all[source].hold(token, pid)
+                invocation.return_value(None)
+            elif method == "Release":
+                source, token = params.unpack()
+                self.all[source].release(token)
+                invocation.return_value(None)
+            elif method == "Pin":
+                profile, seconds = params.unpack()
+                self.all["pin"].pin(profile, seconds)
+                invocation.return_value(None)
+            elif method == "Unpin":
+                self.all["pin"].unpin()
+                invocation.return_value(None)
+            elif method == "Reevaluate":
+                self.runner.invalidate()
+                self.schedule(immediate=True)
+                invocation.return_value(None)
+            elif method == "Reload":
+                self.cfg_timer.cancel()
+                self.reload()
+                invocation.return_value(None)
+            elif method == "Status":
+                invocation.return_value(GLib.Variant("(s)", (json.dumps(self.status()),)))
+            elif method == "Config":
+                invocation.return_value(GLib.Variant("(s)", (json.dumps(self.config_dump()),)))
+            elif method == "History":
+                invocation.return_value(GLib.Variant("(s)", (json.dumps(list(ring.lines)),)))
+            else:
+                invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method)
+        except (KeyError, ValueError) as e:
+            invocation.return_dbus_error("org.freedesktop.DBus.Error.InvalidArgs", f"{method}: {e}")
+
+    def status(self):
+        return {
+            "target": self.target,
+            "applied": self.runner.applied,
+            "reason": self.reason,
+            "failing": self.runner.gave_up,
+            "monitoring": self.monitoring,
+            "sleeping": self.sleeping or self.settling,
+            "order": list(self.sources),
+            "wants": {n: s.wanted() for n, s in self.sources.items()},
+            "config": (_config_hash or "")[:8],
+            "sources": {n: s.describe() for n, s in self.all.items()},
+        }
+
+    def config_dump(self):
+        g = globals()
+        return {
+            "path": config_path(),
+            "values": {k.lower(): g[k] for k in _TUNABLES},
+            "defaults": {k.lower(): _DEFAULTS[k] for k in _TUNABLES},
+            "sources": list(SOURCES),
+        }
+
+    def emit_state(self):
+        self.state_timer.start(100)
+
+    def _emit_state(self):
+        js = json.dumps(self.status(), sort_keys=True)
+        if js != self.last_state and self.session:
+            self.last_state = js
+            self.session.emit_signal(None, OBJ_PATH, IFACE, "StateChanged", GLib.Variant("(s)", (js,)))
+
+    # --- decisions ----------------------------------------------------------
+    def schedule(self, immediate=False):
+        if immediate:
+            self.evaluate()
+        else:
+            self.eval_timer.start(DEBOUNCE_MS)
+
+    def on_ac_changed(self):
+        self.schedule(immediate=True)  # unplugging must switch lights off right now
+
+    def evaluate(self):
+        self.eval_timer.cancel()
+        if self.sleeping or self.settling:
+            self.emit_state()
+            return
+        srcs = self.sources
+        gated = any(s.gate and s.wanted() for s in srcs.values())
+        if gated and self.monitoring:
+            self._set_monitoring(False)
+        elif not gated and not self.monitoring:
+            self._set_monitoring(True)
+            self.schedule()  # let the resyncs land before choosing a profile
+            self.emit_state()
+            return
+        target, reason = PROFILE_DEFAULT, "fallback"
+        for name, s in srcs.items():
+            profile = s.wanted()
+            if profile and ok_profile(profile):
+                target, reason = profile, name
+                break
+        if (target, reason) != (self.target, self.reason):
+            log.info("target: %s (%s)", target, reason)
+        self.target, self.reason = target, reason
+        self.runner.request(target)
+        self.emit_state()
+
+    def _set_monitoring(self, on):
+        if on:
+            for n, s in self.sources.items():
+                if not s.gate and n not in self.running:
+                    s.start()
+                    self.running.add(n)
+        else:
+            for n in list(self.running):
+                self.all[n].stop()
+                self.running.discard(n)
+        self.monitoring = on
+        log.info("monitoring %s", "resumed" if on else "paused (on battery)")
+
+    def reload(self):
+        """Config file changed (inotify) or Reload was called."""
+        if not load_config():
+            return
+        enabled = set(self.sources)
+        if self.monitoring:
+            for n in list(self.running):
+                if n not in enabled:
+                    self.all[n].stop()
+                    self.running.discard(n)
+            for n, s in self.sources.items():
+                if not s.gate and n not in self.running:
+                    s.start()
+                    self.running.add(n)
+        for s in self.all.values():
+            s.reconfigure()
+        self.schedule(immediate=True)
+
+    # --- suspend / resume ---------------------------------------------------
+    def on_sleep(self, going_to_sleep):
+        if going_to_sleep:
+            log.info("suspend: hands off OpenRGB")
+            self.sleeping = True
+            self.settling = False
+            self.settle_timer.cancel()
+            self.eval_timer.cancel()
+            self.runner.hold_off()
+        elif self.sleeping:
+            log.info("resume: settling for %d ms", RESUME_SETTLE_MS)
+            self.sleeping = False
+            self.settling = True
+            self.settle_timer.restart(RESUME_SETTLE_MS)
+        self.emit_state()
+
+    def _after_resume(self):
+        """AC may have been plugged/unplugged while asleep, and USB devices reset on suspend:
+        re-read power state, restart monitors from scratch, then re-apply."""
+        self.settling = False
+        log.info("resume: re-reading power state")
+        self.runner.resume()
+        if self.monitoring:
+            self._set_monitoring(False)
+        self.all["ac"].resync()
+        self.schedule()
+
+    def quit(self, *_):
+        self.loop.quit()
+        return GLib.SOURCE_REMOVE
+
+
+def main():
+    if "--debug" in sys.argv or os.environ.get("RGB_DEBUG"):
+        logging.getLogger().setLevel(logging.DEBUG)
+    loop = GLib.MainLoop()
+    ctl = Controller(loop)
+    ctl.connect()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, ctl.quit)
+
+    def lost(conn, name, *_):
+        log.error("could not own %s (already running?)", BUS_NAME)
+        loop.quit()
+
+    Gio.bus_own_name_on_connection(
+        ctl.session, BUS_NAME, Gio.BusNameOwnerFlags.DO_NOT_QUEUE,
+        lambda conn, name, *_: ctl.start(), lost,
+    )
+    loop.run()
+
+
+if __name__ == "__main__":
+    main()

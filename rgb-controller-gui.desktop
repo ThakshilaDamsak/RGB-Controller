@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=RGB Controller
+GenericName=RGB profile automation
+Comment=Configure when your OpenRGB profiles switch
+Exec=rgb-controller-gui
+Icon=rgb-controller
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=rgb;openrgb;lighting;profiles;
+StartupWMClass=rgb-controller-gui

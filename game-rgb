@@ -1,0 +1,56 @@
+#!/bin/sh
+# game-rgb: hook script for Lutris / Steam to tell rgb-controller a game is running.
+# The daemon keeps the Gaming profile for as long as this hold exists (tied to this PID).
+
+# Usage:
+#   game-rgb start           # called by Lutris pre-launch script
+#   game-rgb stop            # called by Lutris post-exit script
+#   game-rgb run CMD...      # run a command with the hold (like `rgbctl run gaming`)
+
+SVC=org.rgbcontroller.Daemon
+OBJ=/org/rgbcontroller/Daemon
+IFACE=org.rgbcontroller.Daemon1
+
+call() { busctl --user --timeout=3 call "$SVC" "$OBJ" "$IFACE" "$@"; }
+quiet() { call "$@" >/dev/null 2>&1; }
+
+token_file() {
+    # Use XDG_RUNTIME_DIR if available, otherwise /tmp
+    dir="${XDG_RUNTIME_DIR:-/tmp}"
+    echo "$dir/rgb-game-token"
+}
+
+case ${1:-} in
+    start)
+        # Create a hold tied to this shell's PID; the daemon watches the PID and auto-releases on death.
+        tok="game-$$"
+        quiet Hold ssu "gaming" "$tok" "$$" || true
+        # Store token for the stop script (which runs in a different process)
+        printf "%s\n" "$tok" >"$(token_file)"
+        echo "game-rgb: gaming hold started (token: $tok)"
+        ;;
+    stop)
+        # Read token from file (created by start)
+        tok="$(cat "$(token_file)" 2>/dev/null || echo "")"
+        if [ -n "$tok" ]; then
+            quiet Release ss "gaming" "$tok" || true
+            rm -f "$(token_file)"
+        else
+            # Fallback: wildcard release (releases all gaming holds)
+            quiet Release ss "gaming" "*" || true
+        fi
+        echo "game-rgb: gaming hold released"
+        ;;
+    run)
+        shift
+        [ $# -gt 0 ] || { echo "usage: game-rgb run CMD [ARGS...]" >&2; exit 2; }
+        tok="game-$$"
+        quiet Hold ssu "gaming" "$tok" "$$" || true
+        trap 'quiet Release ss "gaming" "$tok" || true' EXIT INT TERM HUP
+        exec "$@"
+        ;;
+    *)
+        echo "usage: game-rgb {start|stop|run CMD...}" >&2
+        exit 2
+        ;;
+esac

@@ -1,0 +1,1520 @@
+#!/usr/bin/env python3
+"""RGB Controller: Qt front end for the rgb-controller daemon.
+
+Closing the window hides it to the tray; the daemon is a separate (systemd user) service and
+keeps switching profiles whether this window exists or not. Quit the GUI from the tray menu.
+
+    rgb-controller-gui            open the window
+    rgb-controller-gui --tray     start hidden in the tray (what the autostart entry uses)
+
+Needs PySide6 (Arch: `pacman -S pyside6`). Everything here is event driven too: the GUI never
+polls, the daemon pushes StateChanged / Log signals over D-Bus.
+"""
+
+import colorsys
+import copy
+import datetime
+import glob
+import json
+import math
+import os
+import shlex
+import sys
+import tempfile
+
+from PySide6.QtCore import QObject, QPointF, QProcess, QRectF, QSize, Qt, QTime, QUrl, Signal, Slot
+from PySide6.QtDBus import QDBusConnection, QDBusMessage, QDBusPendingCallWatcher, QDBusServiceWatcher
+from PySide6.QtGui import (
+    QAction, QBrush, QColor, QConicalGradient, QDesktopServices, QFont, QIcon, QPainter, QPen, QPixmap,
+)
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from PySide6.QtWidgets import (
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
+    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
+    QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QStackedWidget, QSystemTrayIcon, QTableWidget,
+    QTimeEdit, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QHeaderView,
+)
+
+SERVICE = "org.rgbcontroller.Daemon"
+OBJ_PATH = "/org/rgbcontroller/Daemon"
+IFACE = "org.rgbcontroller.Daemon1"
+UNIT = "rgb-controller.service"
+APP_ID = "rgb-controller-gui"
+
+SOURCE_INFO = {
+    "pin": ("Manual pin", "Forces one profile (from the Live page or the tray), optionally for a while."),
+    "loading": ("Loading", "Progress bars, taskbar progress, progress notifications and terminal package jobs."),
+    "gaming": ("Gaming", "A game started through the game-rgb hook (Lutris / Steam)."),
+    "media": ("Media", "Spotify and other MPRIS players (browser video, mpv, VLC...)."),
+    "schedule": ("Schedule", "Time windows from the Schedule page, e.g. lights off at night."),
+    "power": ("Power profile", "power-profiles-daemon: Performance / Balanced / Power saver."),
+}
+REASONS = {
+    "ac": "you are on battery, everything else is paused",
+    "pin": "you pinned it",
+    "loading": "something is loading",
+    "gaming": "a game is running",
+    "media": "media is playing",
+    "schedule": "a schedule window is active",
+    "power": "of the power profile",
+    "fallback": "nothing else applies",
+    "starting": "the daemon is starting up",
+}
+PIN_DURATIONS = [
+    ("Until I unpin it", 0), ("10 seconds (preview)", 10), ("30 minutes", 1800),
+    ("1 hour", 3600), ("2 hours", 7200), ("6 hours", 21600),
+]
+CONFIG_HEADER = (
+    "# Written by rgb-controller-gui. Only settings that differ from the built-in defaults are stored.\n"
+    "# Safe to edit by hand: the daemon reloads this file the moment it changes.\n"
+)
+
+
+# ═══════════════════════════════ colours & icons ═══════════════════════════════
+def profile_color(name):
+    n = (name or "").lower()
+    for key, col in (("game", "#ef4444"), ("load", "#3b82f6"), ("perf", "#f97316"), ("default", "#22c55e"),
+                     ("vomit", "#a3e635"), ("night", "#6366f1"), ("battery", "#9ca3af")):
+        if key in n:
+            return QColor(col)
+    h = sum(ord(c) * (i + 7) for i, c in enumerate(n)) % 360
+    return QColor.fromHsvF(h / 360, 0.65, 0.9)
+
+
+def profile_pixmap(name, size=32):
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    m = size * 0.1
+    r = QRectF(m, m, size - 2 * m, size - 2 * m)
+    n = (name or "").lower()
+    if "rainbow" in n:
+        g = QConicalGradient(r.center(), 90)
+        for i in range(7):
+            g.setColorAt(i / 6, QColor.fromHsvF((i / 6) % 1.0 if i < 6 else 0.0, 0.85, 1.0))
+        p.setBrush(QBrush(g))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(r)
+    elif not name or n == "off":
+        pen = QPen(QColor("#9ca3af"), max(1.5, size * 0.12))
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        half = pen.widthF() / 2
+        p.drawEllipse(r.adjusted(half, half, -half, -half))
+    else:
+        p.setBrush(profile_color(name))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(r)
+        p.setBrush(QColor(255, 255, 255, 70))
+        p.drawEllipse(QRectF(r.left() + r.width() * 0.2, r.top() + r.height() * 0.12, r.width() * 0.4, r.height() * 0.28))
+    p.end()
+    return pm
+
+
+def profile_icon(name):
+    ic = QIcon()
+    for s in (16, 22, 32, 48, 64):
+        ic.addPixmap(profile_pixmap(name, s))
+    return ic
+
+
+def app_icon():
+    themed = QIcon.fromTheme("rgb-controller")
+    return themed if not themed.isNull() else profile_icon("rainbow")
+
+
+# ═══════════════════════════════ config helpers ═══════════════════════════════
+def toml_value(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, str):
+        return json.dumps(v)
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(toml_value(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{" + ", ".join(f"{toml_key(k)} = {toml_value(x)}" for k, x in v.items()) + "}"
+    raise TypeError(f"cannot write {type(v).__name__} to TOML")
+
+
+def toml_key(k):
+    return k if k and all(c.isalnum() or c in "_-" for c in k) else json.dumps(k)
+
+
+def dump_toml(overrides):
+    return CONFIG_HEADER + "\n" + "".join(f"{toml_key(k)} = {toml_value(v)}\n" for k, v in sorted(overrides.items()))
+
+
+def scan_profiles():
+    """OpenRGB keeps one <name>.orp per profile in its config dir (native or flatpak)."""
+    home = os.path.expanduser("~")
+    cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    dirs = [os.path.join(cfg, "OpenRGB"), os.path.join(home, ".var/app/org.openrgb.OpenRGB/config/OpenRGB")]
+    names = {}
+    for d in dirs:
+        for pattern in ("*.orp", "profiles/*.orp"):
+            for f in glob.glob(os.path.join(d, pattern)):
+                stem = os.path.splitext(os.path.basename(f))[0]
+                names.setdefault(stem.lower(), stem)
+    return sorted(names.values(), key=str.lower), [d for d in dirs if os.path.isdir(d)]
+
+
+def gui_prefs_path():
+    return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "rgb-controller", "gui.json")
+
+
+def load_prefs():
+    prefs = {"close_to_tray": True, "tray_color": True, "told_about_tray": False}
+    try:
+        with open(gui_prefs_path()) as f:
+            prefs.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return prefs
+
+
+def save_prefs(prefs):
+    try:
+        os.makedirs(os.path.dirname(gui_prefs_path()), exist_ok=True)
+        with open(gui_prefs_path(), "w") as f:
+            json.dump(prefs, f)
+    except OSError:
+        pass
+
+
+# ═══════════════════════════════ D-Bus client ═══════════════════════════════
+class DaemonClient(QObject):
+    state = Signal(dict)
+    logline = Signal(str)
+    availability = Signal(bool)
+
+    def __init__(self):
+        super().__init__()
+        self.bus = QDBusConnection.sessionBus()
+        self.alive = bool(self.bus.interface().isServiceRegistered(SERVICE).value())
+        self.watcher = QDBusServiceWatcher(
+            SERVICE, self.bus,
+            QDBusServiceWatcher.WatchModeFlag.WatchForRegistration | QDBusServiceWatcher.WatchModeFlag.WatchForUnregistration,
+            self,
+        )
+        self.watcher.serviceRegistered.connect(lambda *_: self._set_alive(True))
+        self.watcher.serviceUnregistered.connect(lambda *_: self._set_alive(False))
+        self.bus.connect(SERVICE, OBJ_PATH, IFACE, "StateChanged", self, "1_on_state(QString)")
+        self.bus.connect(SERVICE, OBJ_PATH, IFACE, "Log", self, "1_on_log(QString)")
+
+    def _set_alive(self, alive):
+        if alive != self.alive:
+            self.alive = alive
+            self.availability.emit(alive)
+
+    @Slot(str)
+    def _on_state(self, js):
+        try:
+            self.state.emit(json.loads(js))
+        except ValueError:
+            pass
+
+    @Slot(str)
+    def _on_log(self, line):
+        self.logline.emit(line)
+
+    def call(self, method, *args, cb=None):
+        msg = QDBusMessage.createMethodCall(SERVICE, OBJ_PATH, IFACE, method)
+        if args:
+            msg.setArguments(list(args))
+        watcher = QDBusPendingCallWatcher(self.bus.asyncCall(msg, 5000), self)
+        watcher.finished.connect(lambda w=watcher: self._done(w, cb))
+
+    def _done(self, watcher, cb):
+        reply = watcher.reply()
+        ok = reply.type() == QDBusMessage.MessageType.ReplyMessage
+        args = reply.arguments()
+        payload = (args[0] if args else None) if ok else (reply.errorMessage() or reply.errorName())
+        watcher.deleteLater()
+        if cb:
+            cb(ok, payload)
+
+    def call_json(self, method, cb):
+        def done(ok, payload):
+            if ok:
+                try:
+                    return cb(True, json.loads(payload))
+                except ValueError:
+                    pass
+            cb(False, payload)
+        self.call(method, cb=done)
+
+
+class Ctx(QObject):
+    """Shared by all pages: the list of OpenRGB profile names found on disk."""
+    changed = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.profiles, self.dirs = [], []
+        self.rescan()
+
+    def rescan(self):
+        self.profiles, self.dirs = scan_profiles()
+        self.changed.emit()
+
+
+def run_async(parent, program, args, cb):
+    proc = QProcess(parent)
+    proc.finished.connect(lambda code, _s, p=proc: (cb(code == 0, bytes(p.readAllStandardOutput()).decode().strip()
+                                                      or bytes(p.readAllStandardError()).decode().strip()), p.deleteLater()))
+    proc.errorOccurred.connect(lambda _e, p=proc: (cb(False, p.errorString()), p.deleteLater()))
+    proc.start(program, args)
+
+
+# ═══════════════════════════════ small widgets ═══════════════════════════════
+class ProfileCombo(QComboBox):
+    """Editable combo of OpenRGB profile names; flags names that are not saved in OpenRGB."""
+    changed = Signal()
+
+    def __init__(self, ctx, allow_empty=False):
+        super().__init__()
+        self.ctx = ctx
+        self.allow_empty = allow_empty
+        self.setEditable(True)
+        self.setMinimumWidth(180)
+        self.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
+        ctx.changed.connect(self._refill)
+        self.editTextChanged.connect(lambda _t: (self._flag(), self.changed.emit()))
+        self._refill()
+
+    def _refill(self):
+        text = self.currentText()
+        self.blockSignals(True)
+        self.clear()
+        for name in self.ctx.profiles:
+            self.addItem(profile_icon(name), name)
+        self.setEditText(text)
+        self.blockSignals(False)
+        self._flag()
+
+    def _flag(self):
+        text = self.currentText()
+        missing = bool(self.ctx.profiles) and bool(text) and text not in self.ctx.profiles
+        self.setStyleSheet("QComboBox { border: 1px solid #d97706; }" if missing else "")
+        self.setToolTip(f"'{text}' is not saved in OpenRGB yet (profiles found: {len(self.ctx.profiles)})" if missing else "")
+
+    def value(self):
+        return self.currentText().strip()
+
+    def set_value(self, v):
+        self.blockSignals(True)
+        self.setEditText(v)
+        self.blockSignals(False)
+        self._flag()
+
+
+class StringList(QWidget):
+    changed = Signal()
+
+    def __init__(self, placeholder=""):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.list = QListWidget()
+        self.list.setMaximumHeight(90)
+        row = QHBoxLayout()
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText(placeholder)
+        add, rem = QPushButton("Add"), QPushButton("Remove")
+        row.addWidget(self.edit, 1)
+        row.addWidget(add)
+        row.addWidget(rem)
+        lay.addWidget(self.list)
+        lay.addLayout(row)
+        add.clicked.connect(self._add)
+        self.edit.returnPressed.connect(self._add)
+        rem.clicked.connect(self._remove)
+
+    def _add(self):
+        t = self.edit.text().strip()
+        if t and t not in self.get():
+            self.list.addItem(t)
+            self.edit.clear()
+            self.changed.emit()
+
+    def _remove(self):
+        for it in self.list.selectedItems():
+            self.list.takeItem(self.list.row(it))
+        self.changed.emit()
+
+    def get(self):
+        return [self.list.item(i).text() for i in range(self.list.count())]
+
+    def set(self, items):
+        self.list.clear()
+        self.list.addItems([str(i) for i in items])
+
+
+def hint(text):
+    lab = QLabel(text)
+    lab.setWordWrap(True)
+    lab.setStyleSheet("color: palette(placeholder-text);")
+    return lab
+
+
+def title(text):
+    lab = QLabel(text)
+    f = lab.font()
+    f.setPointSizeF(f.pointSizeF() * 1.35)
+    f.setBold(True)
+    lab.setFont(f)
+    return lab
+
+
+def scrolled(widget):
+    sa = QScrollArea()
+    sa.setWidgetResizable(True)
+    sa.setFrameShape(QFrame.Shape.NoFrame)
+    sa.setWidget(widget)
+    return sa
+
+
+class Page(QWidget):
+    changed = Signal()
+    editable = True
+
+    def load(self, v):
+        pass
+
+    def dump(self, v):
+        pass
+
+
+# ═══════════════════════════════ pages ═══════════════════════════════
+class ChainWidget(QWidget):
+    """The priority chain as chips: who wins right now, who has an opinion but is outranked, who is idle."""
+
+    def __init__(self):
+        super().__init__()
+        self.lay = QHBoxLayout(self)
+        self.lay.setContentsMargins(0, 0, 0, 0)
+        self.lay.setSpacing(6)
+
+    def set_state(self, s):
+        while self.lay.count():
+            it = self.lay.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        wants = s.get("wants", {})
+        on_batt = s["sources"].get("ac", {}).get("on_battery")
+        winner = s.get("reason")
+        first = True
+        for name in s.get("order", []):
+            if not first:
+                arrow = QLabel("›")
+                arrow.setStyleSheet("color: palette(placeholder-text);")
+                self.lay.addWidget(arrow)
+            first = False
+            label = "AC power" if name == "ac" else SOURCE_INFO.get(name, (name, ""))[0]
+            w = wants.get(name)
+            if name == "ac":
+                text = "On battery → " + (w or "?") if on_batt else "Plugged in"
+            else:
+                text = f"{label}  →  {w}" if w else label
+            chip = QLabel(text)
+            base = "padding: 4px 10px; border-radius: 11px;"
+            if name == winner:
+                chip.setStyleSheet(base + "background: palette(highlight); color: palette(highlighted-text); font-weight: bold;")
+            elif w:
+                chip.setStyleSheet(base + "border: 1px dashed palette(mid);")
+            else:
+                chip.setStyleSheet(base + "border: 1px solid palette(midlight); color: palette(placeholder-text);")
+            self.lay.addWidget(chip)
+        if winner == "fallback":
+            arrow = QLabel("›")
+            arrow.setStyleSheet("color: palette(placeholder-text);")
+            self.lay.addWidget(arrow)
+            chip = QLabel("Fallback  →  " + str(s.get("target")))
+            chip.setStyleSheet("padding: 4px 10px; border-radius: 11px; background: palette(highlight); "
+                               "color: palette(highlighted-text); font-weight: bold;")
+            self.lay.addWidget(chip)
+        self.lay.addStretch(1)
+
+
+class LivePage(Page):
+    editable = False
+
+    def __init__(self, ctx, daemon, window):
+        super().__init__()
+        self.ctx, self.daemon, self.window_ = ctx, daemon, window
+        self.state = None
+        lay = QVBoxLayout(self)
+        lay.addWidget(title("Live"))
+
+        card = QFrame()
+        card.setFrameShape(QFrame.Shape.StyledPanel)
+        cl = QHBoxLayout(card)
+        self.dot = QLabel()
+        self.dot.setFixedSize(64, 64)
+        cl.addWidget(self.dot)
+        col = QVBoxLayout()
+        self.now = QLabel("…")
+        f = self.now.font()
+        f.setPointSizeF(f.pointSizeF() * 2)
+        f.setBold(True)
+        self.now.setFont(f)
+        self.why = QLabel("")
+        self.applied = QLabel("")
+        col.addWidget(self.now)
+        col.addWidget(self.why)
+        col.addWidget(self.applied)
+        cl.addLayout(col, 1)
+        lay.addWidget(card)
+
+        lay.addWidget(QLabel("Priority, highest first:"))
+        self.chain = ChainWidget()
+        lay.addWidget(self.chain)
+
+        pin = QGroupBox("Pin a profile")
+        pl = QVBoxLayout(pin)
+        row = QHBoxLayout()
+        self.pin_combo = ProfileCombo(ctx)
+        self.dur = QComboBox()
+        for label, secs in PIN_DURATIONS:
+            self.dur.addItem(label, secs)
+        pin_btn, unpin_btn = QPushButton("Pin"), QPushButton("Unpin")
+        row.addWidget(self.pin_combo, 1)
+        row.addWidget(QLabel("for"))
+        row.addWidget(self.dur)
+        row.addWidget(pin_btn)
+        row.addWidget(unpin_btn)
+        pl.addLayout(row)
+        self.quick = QGridLayout()
+        pl.addLayout(self.quick)
+        self.pin_state = hint("")
+        pl.addWidget(self.pin_state)
+        lay.addWidget(pin)
+        pin_btn.clicked.connect(lambda: self.pin(self.pin_combo.value()))
+        unpin_btn.clicked.connect(lambda: daemon.call("Unpin", cb=self._result))
+        ctx.changed.connect(self._quick_buttons)
+        self._quick_buttons()
+
+        lay.addWidget(QLabel("Triggers:"))
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Source", "State", "Details"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        lay.addWidget(self.tree, 1)
+
+        row = QHBoxLayout()
+        re = QPushButton("Re-apply now")
+        re.setToolTip("Forget what the lights are doing and apply the current profile again")
+        re.clicked.connect(lambda: daemon.call("Reevaluate", cb=self._result))
+        row.addWidget(re)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+    def _result(self, ok, payload):
+        if not ok:
+            self.window_.flash(f"Daemon said no: {payload}")
+
+    def pin(self, profile):
+        if profile:
+            self.daemon.call("Pin", profile, int(self.dur.currentData()), cb=self._result)
+
+    def _quick_buttons(self):
+        while self.quick.count():
+            self.quick.takeAt(0).widget().deleteLater()
+        for i, name in enumerate(self.ctx.profiles):
+            b = QPushButton(profile_icon(name), name)
+            b.setIconSize(QSize(16, 16))
+            b.clicked.connect(lambda _c=False, n=name: self.pin(n))
+            self.quick.addWidget(b, i // 4, i % 4)
+
+    def set_state(self, s):
+        self.state = s
+        target = s.get("target") or "…"
+        self.dot.setPixmap(profile_pixmap(target, 64))
+        self.now.setText(target)
+        reason = s.get("reason", "")
+        why = REASONS.get(reason, reason)
+        if reason == "power":
+            why += f" ({s['sources'].get('power', {}).get('mode') or 'unknown'})"
+        self.why.setText(f"because {why}")
+        if s.get("failing"):
+            self.applied.setText("OpenRGB keeps failing, check the Log page")
+            self.applied.setStyleSheet("color: #dc2626;")
+        elif s.get("sleeping"):
+            self.applied.setText("System is suspended or just resumed, lights are left alone")
+            self.applied.setStyleSheet("")
+        else:
+            ap = s.get("applied")
+            self.applied.setText(f"Applied to your devices: {ap}" if ap == target else f"Applying {target}…")
+            self.applied.setStyleSheet("")
+        self.chain.set_state(s)
+
+        pin = s["sources"].get("pin", {})
+        if pin.get("profile"):
+            left = pin.get("remaining_s")
+            until = (datetime.datetime.now() + datetime.timedelta(seconds=left)).strftime("%H:%M") if left is not None else None
+            self.pin_state.setText(f"Pinned: {pin['profile']}" + (f" until {until}" if until else " until you unpin it"))
+        else:
+            self.pin_state.setText("Nothing pinned.")
+
+        self.tree.clear()
+        for name, d in s["sources"].items():
+            label = "AC power" if name == "ac" else SOURCE_INFO.get(name, (name, ""))[0]
+            enabled = name in s.get("order", [])
+            if name == "ac":
+                st, det = ("On battery" if d.get("on_battery") else "Plugged in"), ""
+            elif name == "loading":
+                st = "Active" if d.get("confirmed") else "Idle"
+                det = ", ".join(d.get("progress", []) + d.get("holds", [])) or ""
+            elif name == "gaming":
+                st, det = ("Running" if d.get("holds") else "Idle"), ", ".join(d.get("holds", []))
+            elif name == "media":
+                playing = [k for k, v in d.items() if v == "Playing"]
+                st, det = ("Playing" if playing else "Idle"), ", ".join(f"{k}: {v}" for k, v in d.items())
+            elif name == "pin":
+                st, det = ("Pinned" if d.get("profile") else "Idle"), d.get("profile") or ""
+            elif name == "schedule":
+                st, det = ("Window active" if d.get("active") else "Idle"), f"{d.get('windows', 0)} window(s)"
+            elif name == "power":
+                st, det = (d.get("mode") or "unknown"), ""
+            else:
+                st, det = "", json.dumps(d)
+            if not enabled:
+                st = "disabled"
+            item = QTreeWidgetItem([label, st, det])
+            if not enabled:
+                for c in range(3):
+                    item.setForeground(c, self.palette().placeholderText())
+            self.tree.addTopLevelItem(item)
+        for c in (0, 1):
+            self.tree.resizeColumnToContents(c)
+
+
+class ProfilesPage(Page):
+    ROWS = [
+        ("Power profile mapping", None, None),
+        ("profile_default", "Balanced mode (and fallback)", "What the lights do when nothing else is going on and the power profile is Balanced."),
+        ("profile_performance", "Performance mode", "Fallback while power-profiles-daemon is in Performance."),
+        ("profile_power_saver", "Power-saver mode", "Fallback in Power saver while plugged in. On battery everything is off anyway."),
+        ("Situations", None, None),
+        ("profile_battery", "On battery", "Applied the moment you unplug. Everything else is paused until you plug in again."),
+        ("profile_loading", "Loading", "Progress bars, package manager jobs."),
+        ("profile_gaming", "Gaming", "While a game started through game-rgb is running."),
+        ("profile_spotify", "Spotify playing", ""),
+        ("profile_other_media", "Other media playing", "Browser video, mpv, VLC... (anything MPRIS that is not Spotify)."),
+    ]
+
+    def __init__(self, ctx, daemon):
+        super().__init__()
+        self.ctx, self.daemon = ctx, daemon
+        self.combos = {}
+        lay = QVBoxLayout(self)
+        lay.addWidget(title("Profiles"))
+        lay.addWidget(hint("Pick which saved OpenRGB profile goes with each situation. Orange border = no profile "
+                           "with that name found in OpenRGB. ▶ shows it on your lights for 6 seconds."))
+        form = QGridLayout()
+        r = 0
+        for key, label, desc in self.ROWS:
+            if label is None:
+                head = QLabel(f"<b>{key}</b>")
+                form.addWidget(head, r, 0, 1, 3)
+                r += 1
+                continue
+            combo = ProfileCombo(ctx)
+            combo.changed.connect(self.changed)
+            self.combos[key] = combo
+            prev = QToolButton()
+            prev.setText("▶")
+            prev.setToolTip("Preview for 6 seconds")
+            prev.clicked.connect(lambda _c=False, c=combo: self.preview(c.value()))
+            form.addWidget(QLabel(label), r, 0)
+            form.addWidget(combo, r, 1)
+            form.addWidget(prev, r, 2)
+            if desc:
+                form.addWidget(hint(desc), r + 1, 0, 1, 3)
+                r += 1
+            r += 1
+        form.setColumnStretch(1, 1)
+        lay.addLayout(form)
+        row = QHBoxLayout()
+        rescan = QPushButton("Rescan OpenRGB profiles")
+        rescan.clicked.connect(ctx.rescan)
+        opener = QPushButton("Open OpenRGB")
+        opener.clicked.connect(lambda: QProcess.startDetached("openrgb", []))
+        self.found = hint("")
+        row.addWidget(rescan)
+        row.addWidget(opener)
+        row.addWidget(self.found, 1)
+        lay.addLayout(row)
+        lay.addStretch(1)
+        ctx.changed.connect(self._found)
+        self._found()
+
+    def _found(self):
+        n = len(self.ctx.profiles)
+        where = ", ".join(self.ctx.dirs) or "no OpenRGB config folder found"
+        self.found.setText(f"{n} profile(s) found in {where}")
+
+    def preview(self, name):
+        if name:
+            self.daemon.call("Pin", name, 6)
+
+    def load(self, v):
+        for k, c in self.combos.items():
+            c.set_value(v.get(k, ""))
+
+    def dump(self, v):
+        for k, c in self.combos.items():
+            v[k] = c.value()
+
+
+class PriorityPage(Page):
+    def __init__(self, ctx, daemon):
+        super().__init__()
+        self.defaults = {}
+        lay = QVBoxLayout(self)
+        lay.addWidget(title("Priority"))
+        lay.addWidget(hint("Drag to reorder: the first ticked entry that has something to say wins. Untick to disable a "
+                           "trigger completely. AC power is not in the list because it is a hard gate: on battery "
+                           "the lights go to the battery profile and every trigger below sleeps."))
+        ac = QLabel("🔌  AC power: always first, not movable")
+        ac.setStyleSheet("padding: 6px; border: 1px solid palette(mid); border-radius: 6px;")
+        lay.addWidget(ac)
+        self.list = QListWidget()
+        self.list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.list.model().rowsMoved.connect(lambda *_: (self._renumber(), self.changed.emit()))
+        self.list.itemChanged.connect(lambda _i: (self._renumber(), self.changed.emit()))
+        lay.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        reset = QPushButton("Reset to default order")
+        reset.clicked.connect(self._reset)
+        row.addWidget(reset)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+    def _fill(self, enabled, all_names):
+        self.list.blockSignals(True)
+        self.list.clear()
+        for name in list(enabled) + [n for n in all_names if n not in enabled]:
+            if name not in SOURCE_INFO:
+                continue
+            it = QListWidgetItem()
+            it.setData(Qt.ItemDataRole.UserRole, name)
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsDragEnabled)
+            it.setCheckState(Qt.CheckState.Checked if name in enabled else Qt.CheckState.Unchecked)
+            self.list.addItem(it)
+        self.list.blockSignals(False)
+        self._renumber()
+
+    def _renumber(self):
+        n = 1
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            name = it.data(Qt.ItemDataRole.UserRole)
+            label, desc = SOURCE_INFO[name]
+            on = it.checkState() == Qt.CheckState.Checked
+            it.setText(f"{n + 1}.  {label}\n      {desc}" if on else f"–.  {label}   (disabled)\n      {desc}")
+            if on:
+                n += 1
+
+    def _reset(self):
+        self._fill(self.defaults.get("priority", []), list(SOURCE_INFO))
+        self.changed.emit()
+
+    def load(self, v):
+        self.defaults = v.get("__defaults__", {})
+        self._fill(v.get("priority", []), list(SOURCE_INFO))
+
+    def dump(self, v):
+        v["priority"] = [self.list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.list.count())
+                         if self.list.item(i).checkState() == Qt.CheckState.Checked]
+
+
+class TriggersPage(Page):
+    def __init__(self, ctx, daemon):
+        super().__init__()
+        self.ctx = ctx
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.addWidget(title("Triggers"))
+
+        g = QGroupBox("Loading: what counts as a progress bar")
+        gl = QVBoxLayout(g)
+        self.w_job = QCheckBox("KDE job views (Dolphin copies/moves, Discover, KIO downloads)")
+        self.w_launcher = QCheckBox("Taskbar progress (browser downloads, installers: com.canonical.Unity.LauncherEntry)")
+        self.w_notif = QCheckBox("Notifications that carry a progress bar")
+        for c in (self.w_job, self.w_launcher, self.w_notif):
+            c.toggled.connect(self.changed)
+            gl.addWidget(c)
+        gl.addWidget(QLabel("Ignore progress notifications from these apps:"))
+        self.ign_notif = StringList("app name, e.g. Spotify")
+        self.ign_notif.changed.connect(self.changed)
+        gl.addWidget(self.ign_notif)
+        gl.addWidget(hint("Terminal jobs (pacman, paru, cachyos-rate-mirrors...) come from the Fish wrapper, "
+                          "see the README. Watching is switched off while you are on battery."))
+        lay.addWidget(g)
+
+        g = QGroupBox("Media")
+        gl = QVBoxLayout(g)
+        gl.addWidget(QLabel("A player counts as Spotify when its MPRIS name contains:"))
+        self.hints = StringList("spotify")
+        self.hints.changed.connect(self.changed)
+        gl.addWidget(self.hints)
+        self.beats = QCheckBox("Spotify wins when it plays together with other media")
+        self.beats.toggled.connect(self.changed)
+        gl.addWidget(self.beats)
+        gl.addWidget(QLabel("Ignore these players (e.g. kdeconnect for music playing on your phone):"))
+        self.ign_players = StringList("part of the player name")
+        self.ign_players.changed.connect(self.changed)
+        gl.addWidget(self.ign_players)
+        gl.addWidget(QLabel("<b>Per-player profiles</b>  (first match wins, beats the Spotify rule)"))
+        self.rules = QTableWidget(0, 3)
+        self.rules.setHorizontalHeaderLabels(["Player name contains", "Profile", ""])
+        self.rules.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.rules.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.rules.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.rules.verticalHeader().hide()
+        self.rules.setMinimumHeight(140)
+        gl.addWidget(self.rules)
+        add = QPushButton("Add rule")
+        add.clicked.connect(lambda: (self._rule_row("", ""), self.changed.emit()))
+        gl.addWidget(add, 0, Qt.AlignmentFlag.AlignLeft)
+        gl.addWidget(hint("Names are the part after org.mpris.MediaPlayer2. (see the Live page for what is running), "
+                          "for example vlc, mpv, firefox, chromium."))
+        lay.addWidget(g)
+        lay.addStretch(1)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scrolled(body))
+
+    def _rule_row(self, match, profile):
+        r = self.rules.rowCount()
+        self.rules.insertRow(r)
+        le = QLineEdit(match)
+        le.textChanged.connect(self.changed)
+        combo = ProfileCombo(self.ctx)
+        combo.set_value(profile)
+        combo.changed.connect(self.changed)
+        rm = QToolButton()
+        rm.setText("✕")
+        rm.clicked.connect(lambda _c=False, w=le: self._remove_rule(w))
+        self.rules.setCellWidget(r, 0, le)
+        self.rules.setCellWidget(r, 1, combo)
+        self.rules.setCellWidget(r, 2, rm)
+
+    def _remove_rule(self, widget):
+        for r in range(self.rules.rowCount()):
+            if self.rules.cellWidget(r, 0) is widget:
+                self.rules.removeRow(r)
+                break
+        self.changed.emit()
+
+    def load(self, v):
+        self.w_job.setChecked(v.get("watch_jobview", True))
+        self.w_launcher.setChecked(v.get("watch_launcher", True))
+        self.w_notif.setChecked(v.get("watch_notifications", True))
+        self.ign_notif.set(v.get("ignore_notification_apps", []))
+        self.hints.set(v.get("spotify_hints", []))
+        self.beats.setChecked(v.get("spotify_beats_other_media", True))
+        self.ign_players.set(v.get("ignore_players", []))
+        self.rules.setRowCount(0)
+        for r in v.get("media_rules", []):
+            self._rule_row(r.get("match", ""), r.get("profile", ""))
+
+    def dump(self, v):
+        v["watch_jobview"] = self.w_job.isChecked()
+        v["watch_launcher"] = self.w_launcher.isChecked()
+        v["watch_notifications"] = self.w_notif.isChecked()
+        v["ignore_notification_apps"] = self.ign_notif.get()
+        v["spotify_hints"] = self.hints.get()
+        v["spotify_beats_other_media"] = self.beats.isChecked()
+        v["ignore_players"] = self.ign_players.get()
+        rules = []
+        for r in range(self.rules.rowCount()):
+            m, p = self.rules.cellWidget(r, 0).text().strip(), self.rules.cellWidget(r, 1).value()
+            if m and p:
+                rules.append({"match": m, "profile": p})
+        v["media_rules"] = rules
+
+
+class SchedulePage(Page):
+    DAYS = "MTWTFSS"
+
+    def __init__(self, ctx, daemon):
+        super().__init__()
+        self.ctx = ctx
+        lay = QVBoxLayout(self)
+        lay.addWidget(title("Schedule"))
+        lay.addWidget(hint("Time windows with their own profile, e.g. lights off from 23:30 to 07:00. A window may cross "
+                           "midnight; its days are the days it starts on. Needs the Schedule trigger ticked on the "
+                           "Priority page, and it only wins over triggers ranked below it there."))
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Name", "From", "To", "Days", "Profile", ""])
+        self.table.verticalHeader().hide()
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        for c in (1, 2, 3, 5):
+            self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
+        lay.addWidget(self.table, 1)
+        row = QHBoxLayout()
+        add = QPushButton("Add window")
+        add.clicked.connect(lambda: (self._row("", "22:00", "07:00", range(7), ""), self.changed.emit()))
+        night = QPushButton("Add night mode (23:30 → 07:00, lights off)")
+        night.clicked.connect(lambda: (self._row("Night", "23:30", "07:00", range(7), "Off"), self.changed.emit()))
+        row.addWidget(add)
+        row.addWidget(night)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+    def _row(self, name, start, end, days, profile):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        le = QLineEdit(name)
+        le.textChanged.connect(self.changed)
+        t1, t2 = QTimeEdit(QTime.fromString(start, "HH:mm")), QTimeEdit(QTime.fromString(end, "HH:mm"))
+        for t in (t1, t2):
+            t.setDisplayFormat("HH:mm")
+            t.timeChanged.connect(self.changed)
+        dw = QWidget()
+        dl = QHBoxLayout(dw)
+        dl.setContentsMargins(2, 0, 2, 0)
+        dl.setSpacing(2)
+        for i, ch in enumerate(self.DAYS):
+            b = QToolButton()
+            b.setText(ch)
+            b.setCheckable(True)
+            b.setChecked(i in days)
+            b.setToolTip(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][i])
+            b.toggled.connect(self.changed)
+            dl.addWidget(b)
+        combo = ProfileCombo(self.ctx)
+        combo.set_value(profile)
+        combo.changed.connect(self.changed)
+        rm = QToolButton()
+        rm.setText("✕")
+        rm.clicked.connect(lambda _c=False, w=le: self._remove(w))
+        for c, w in enumerate((le, t1, t2, dw, combo, rm)):
+            self.table.setCellWidget(r, c, w)
+        self.table.setRowHeight(r, 34)
+
+    def _remove(self, widget):
+        for r in range(self.table.rowCount()):
+            if self.table.cellWidget(r, 0) is widget:
+                self.table.removeRow(r)
+                break
+        self.changed.emit()
+
+    def load(self, v):
+        self.table.setRowCount(0)
+        for w in v.get("schedule", []):
+            self._row(w.get("name", ""), w.get("start", "00:00"), w.get("end", "00:00"), w.get("days", range(7)), w.get("profile", ""))
+
+    def dump(self, v):
+        out = []
+        for r in range(self.table.rowCount()):
+            name = self.table.cellWidget(r, 0).text().strip()
+            t1, t2 = self.table.cellWidget(r, 1).time(), self.table.cellWidget(r, 2).time()
+            btns = self.table.cellWidget(r, 3).findChildren(QToolButton)
+            days = [i for i, b in enumerate(btns) if b.isChecked()]
+            prof = self.table.cellWidget(r, 4).value()
+            if prof and days:
+                out.append({"name": name, "start": t1.toString("HH:mm"), "end": t2.toString("HH:mm"), "days": days, "profile": prof})
+        v["schedule"] = out
+
+
+class TimingPage(Page):
+    SPINS = [
+        ("debounce_ms", "Debounce", "ms", 0, 5000, 50, "Bursts of events (a track change, a window of D-Bus chatter) become one decision."),
+        ("loading_grace_ms", "Loading grace", "ms", 0, 30000, 100, "Progress shorter than this never shows Loading (no flicker for tiny copies)."),
+        ("loading_linger_ms", "Loading linger", "ms", 0, 30000, 100, "Keep Loading this long after the last job ends, so back-to-back jobs do not flap."),
+        ("resume_settle_ms", "Resume settle", "ms", 0, 30000, 100, "After suspend, wait this long before touching USB devices again."),
+        ("progress_stale_s", "Stale progress", "s", 10, 86400, 30, "Forget a progress bar nobody has updated for this long (crashed app)."),
+        ("openrgb_timeout_s", "OpenRGB timeout", "s", 3, 300, 1, "Kill an openrgb call that takes longer than this."),
+        ("media_off_delay_s", "Media OFF delay", "s", 0, 300, 1, "Wait this long after non-Spotify media starts before turning lights off (0 = instant). Prevents flicker when scrolling past videos."),
+    ]
+
+    def __init__(self, ctx, daemon):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        lay.addWidget(title("Timing"))
+        lay.addWidget(hint("Nothing here polls: these are one-shot timers that only exist while something is pending."))
+        grid = QGridLayout()
+        self.spins = {}
+        r = 0
+        for key, label, unit, lo, hi, step, desc in self.SPINS:
+            sp = QSpinBox()
+            sp.setRange(lo, hi)
+            sp.setSingleStep(step)
+            sp.setSuffix(" " + unit)
+            sp.valueChanged.connect(self.changed)
+            self.spins[key] = sp
+            grid.addWidget(QLabel(label), r, 0)
+            grid.addWidget(sp, r, 1)
+            grid.addWidget(hint(desc), r, 2)
+            r += 1
+        self.hold = QDoubleSpinBox()
+        self.hold.setRange(0, 168)
+        self.hold.setDecimals(2)
+        self.hold.setSingleStep(0.5)
+        self.hold.setSuffix(" h")
+        self.hold.valueChanged.connect(self.changed)
+        grid.addWidget(QLabel("Game hold limit"), r, 0)
+        grid.addWidget(self.hold, r, 1)
+        grid.addWidget(hint("Safety net: a game-rgb start that never gets its stop (Lutris crashed) expires after this. 0 = never."), r, 2)
+        r += 1
+        self.retry = QLineEdit()
+        self.retry.setPlaceholderText("2, 5, 15")
+        self.retry.textChanged.connect(self.changed)
+        grid.addWidget(QLabel("Retry delays (s)"), r, 0)
+        grid.addWidget(self.retry, r, 1)
+        grid.addWidget(hint("If openrgb fails (USB not ready), retry after these many seconds, then give up until the next change."), r, 2)
+        grid.setColumnStretch(2, 1)
+        lay.addLayout(grid)
+        lay.addStretch(1)
+
+    def load(self, v):
+        for k, sp in self.spins.items():
+            sp.blockSignals(True)
+            if k == "media_off_delay_s":
+                # Daemon stores ms, GUI uses seconds
+                sp.setValue(int(v.get("media_off_delay_ms", 0)) // 1000)
+            else:
+                sp.setValue(int(v.get(k, 0)))
+            sp.blockSignals(False)
+        self.hold.blockSignals(True)
+        self.hold.setValue(float(v.get("hold_max_hours", 12)))
+        self.hold.blockSignals(False)
+        self.retry.blockSignals(True)
+        self.retry.setText(", ".join(str(x) for x in v.get("retry_delays_s", [])))
+        self.retry.blockSignals(False)
+
+    def dump(self, v):
+        for k, sp in self.spins.items():
+            if k == "media_off_delay_s":
+                # GUI stores seconds, daemon expects ms
+                v["media_off_delay_ms"] = sp.value() * 1000
+            else:
+                v[k] = sp.value()
+        v["hold_max_hours"] = self.hold.value()
+        delays = []
+        for part in self.retry.text().replace(";", ",").split(","):
+            part = part.strip()
+            if part.isdigit() and int(part) > 0:
+                delays.append(int(part))
+        v["retry_delays_s"] = delays
+
+
+class AdvancedPage(Page):
+    def __init__(self, ctx, daemon, window):
+        super().__init__()
+        self.daemon, self.window_ = daemon, window
+        self.config_path = ""
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.addWidget(title("Advanced"))
+
+        g = QGroupBox("How profiles are applied")
+        gl = QVBoxLayout(g)
+        self.cmd = QLineEdit()
+        self.cmd.textChanged.connect(self.changed)
+        gl.addWidget(self.cmd)
+        row = QHBoxLayout()
+        plain = QPushButton("Plain openrgb")
+        plain.clicked.connect(lambda: self.cmd.setText("openrgb"))
+        srv = QPushButton("Use a running OpenRGB server (faster)")
+        srv.setToolTip("openrgb --client localhost:6742  (start the server with: openrgb --server)")
+        srv.clicked.connect(lambda: self.cmd.setText("openrgb --client localhost:6742"))
+        test = QPushButton("Test")
+        test.clicked.connect(self._test)
+        row.addWidget(plain)
+        row.addWidget(srv)
+        row.addWidget(test)
+        row.addStretch(1)
+        gl.addLayout(row)
+        gl.addWidget(hint("The profile name is added as: <command> --profile NAME. A full device scan per switch can take a "
+                          "second or two; with a server running it is instant."))
+        lay.addWidget(g)
+
+        g = QGroupBox("Daemon")
+        gl = QVBoxLayout(g)
+        self.dstate = QLabel("…")
+        gl.addWidget(self.dstate)
+        row = QHBoxLayout()
+        for text, act in (("Start", "start"), ("Stop", "stop"), ("Restart", "restart")):
+            b = QPushButton(text)
+            b.clicked.connect(lambda _c=False, a=act: self.systemctl(a))
+            row.addWidget(b)
+        row.addStretch(1)
+        gl.addLayout(row)
+        self.d_enabled = QCheckBox("Start the daemon at login")
+        self.d_enabled.clicked.connect(lambda on: self.systemctl("enable" if on else "disable"))
+        gl.addWidget(self.d_enabled)
+        gl.addWidget(hint("Closing this window never stops the daemon. Stopping it here leaves your lights as they are."))
+        lay.addWidget(g)
+
+        g = QGroupBox("This window")
+        gl = QVBoxLayout(g)
+        self.close_tray = QCheckBox("Closing the window keeps it in the tray")
+        self.tray_color = QCheckBox("Tray icon takes the colour of the current profile")
+        self.autostart = QCheckBox("Start in the tray at login")
+        for c, key in ((self.close_tray, "close_to_tray"), (self.tray_color, "tray_color")):
+            c.clicked.connect(lambda on, k=key: window.set_pref(k, on))
+            gl.addWidget(c)
+        self.autostart.clicked.connect(self._autostart)
+        gl.addWidget(self.autostart)
+        lay.addWidget(g)
+
+        g = QGroupBox("Config file")
+        gl = QVBoxLayout(g)
+        self.path_lab = QLabel("")
+        self.path_lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        gl.addWidget(self.path_lab)
+        row = QHBoxLayout()
+        for text, fn in (("Open file", self._open_file), ("Open folder", self._open_dir), ("Export…", self._export),
+                         ("Import…", self._import), ("Reset everything to defaults", self._reset)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addStretch(1)
+        gl.addLayout(row)
+        gl.addWidget(hint("The file only lists what differs from the built-in defaults, and the daemon applies edits the "
+                          "moment the file is saved, whether they come from here or from your editor."))
+        lay.addWidget(g)
+        lay.addStretch(1)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scrolled(body))
+        self.refresh_system()
+
+    # --- values --------------------------------------------------------------------
+    def load(self, v):
+        self.config_path = v.get("__path__", "")
+        self.path_lab.setText(self.config_path)
+        self.cmd.blockSignals(True)
+        self.cmd.setText(shlex.join(v.get("openrgb_cmd", ["openrgb"])))
+        self.cmd.blockSignals(False)
+
+    def dump(self, v):
+        try:
+            parts = shlex.split(self.cmd.text())
+        except ValueError:
+            parts = []
+        v["openrgb_cmd"] = parts or ["openrgb"]
+
+    # --- helpers -------------------------------------------------------------------
+    def _test(self):
+        try:
+            argv = shlex.split(self.cmd.text()) or ["openrgb"]
+        except ValueError as e:
+            return self.window_.flash(f"Cannot parse the command: {e}")
+        run_async(self, argv[0], [*argv[1:], "--version"], lambda ok, out: self.window_.flash(
+            (f"OK: {out.splitlines()[0]}" if out else "OK") if ok else f"Failed: {out[:200]}"))
+
+    def systemctl(self, action):
+        def done(ok, out):
+            if not ok and action in ("start", "restart"):
+                QProcess.startDetached("rgb-controller", [])  # not installed as a service: run it directly
+                self.window_.flash("systemd unit not found, started the daemon directly")
+            elif not ok:
+                self.window_.flash(f"systemctl {action}: {out[:200]}")
+            self.refresh_system()
+        run_async(self, "systemctl", ["--user", action, UNIT], done)
+
+    def refresh_system(self):
+        run_async(self, "systemctl", ["--user", "is-enabled", UNIT], lambda ok, out: self.d_enabled.setChecked(out == "enabled"))
+        self.dstate.setText("Running" if self.daemon.alive else "Not running")
+
+    def _autostart_path(self):
+        return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "autostart", "rgb-controller-gui.desktop")
+
+    def _autostart(self, on):
+        path = self._autostart_path()
+        try:
+            if on:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as f:
+                    f.write("[Desktop Entry]\nType=Application\nName=RGB Controller (tray)\nExec=rgb-controller-gui --tray\n"
+                            "Icon=rgb-controller\nTerminal=false\nX-GNOME-Autostart-enabled=true\n")
+            elif os.path.exists(path):
+                os.remove(path)
+        except OSError as e:
+            self.window_.flash(f"Autostart: {e}")
+
+    def sync_prefs(self, prefs):
+        self.close_tray.setChecked(prefs["close_to_tray"])
+        self.tray_color.setChecked(prefs["tray_color"])
+        self.autostart.setChecked(os.path.exists(self._autostart_path()))
+
+    def _open_file(self):
+        if self.config_path:
+            if not os.path.exists(self.config_path):
+                self.window_.save_overrides({})
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.config_path))
+
+    def _open_dir(self):
+        if self.config_path:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(self.config_path)))
+
+    def _export(self):
+        dest, _ = QFileDialog.getSaveFileName(self, "Export config", "rgb-controller-config.toml", "TOML (*.toml)")
+        if dest and self.config_path and os.path.exists(self.config_path):
+            with open(self.config_path, "rb") as src, open(dest, "wb") as out:
+                out.write(src.read())
+            self.window_.flash(f"Exported to {dest}")
+
+    def _import(self):
+        src, _ = QFileDialog.getOpenFileName(self, "Import config", "", "TOML (*.toml)")
+        if src and self.config_path:
+            with open(src, "rb") as f:
+                self.window_.write_raw(f.read())
+
+    def _reset(self):
+        if QMessageBox.question(self, "Reset", "Forget all your settings and go back to the built-in defaults?") == QMessageBox.StandardButton.Yes:
+            self.window_.save_overrides({})
+
+
+class LogPage(Page):
+    editable = False
+
+    def __init__(self, daemon):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        lay.addWidget(title("Log"))
+        row = QHBoxLayout()
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText("filter…")
+        self.filter.textChanged.connect(self._refilter)
+        clear = QPushButton("Clear")
+        clear.clicked.connect(self._clear)
+        copy_b = QPushButton("Copy")
+        copy_b.clicked.connect(lambda: QApplication.clipboard().setText(self.view.toPlainText()))
+        row.addWidget(self.filter, 1)
+        row.addWidget(clear)
+        row.addWidget(copy_b)
+        lay.addLayout(row)
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setMaximumBlockCount(2000)
+        f = QFont("monospace")
+        f.setStyleHint(QFont.StyleHint.Monospace)
+        self.view.setFont(f)
+        lay.addWidget(self.view, 1)
+        self.lines = []
+        daemon.logline.connect(self.add)
+
+    def _matches(self, line):
+        return self.filter.text().lower() in line.lower()
+
+    def add(self, line):
+        self.lines.append(line)
+        self.lines = self.lines[-2000:]
+        if self._matches(line):
+            self.view.appendPlainText(line)
+
+    def set_history(self, lines):
+        self.lines = list(lines)
+        self._refilter()
+
+    def _refilter(self):
+        self.view.setPlainText("\n".join(l for l in self.lines if self._matches(l)))
+        self.view.verticalScrollBar().setValue(self.view.verticalScrollBar().maximum())
+
+    def _clear(self):
+        self.lines = []
+        self.view.clear()
+
+
+# ═══════════════════════════════ main window ═══════════════════════════════
+class Window(QMainWindow):
+    def __init__(self, app, daemon, ctx, prefs):
+        super().__init__()
+        self.app, self.daemon, self.ctx, self.prefs = app, daemon, ctx, prefs
+        self.values, self.defaults, self.config_path = {}, {}, ""
+        self.config_version = None
+        self.dirty = False
+        self.state = None
+        self.tray = None
+        self.setWindowTitle("RGB Controller")
+        self.setWindowIcon(app_icon())
+        self.resize(1040, 720)
+
+        root = QWidget()
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self.banner = QFrame()
+        self.banner.setStyleSheet("background: #b45309; color: white;")
+        bl = QHBoxLayout(self.banner)
+        bl.addWidget(QLabel("The rgb-controller daemon is not running, so nothing is switching your lights."))
+        bl.addStretch(1)
+        start = QPushButton("Start it")
+        start.clicked.connect(lambda: self.advanced.systemctl("start"))
+        bl.addWidget(start)
+        outer.addWidget(self.banner)
+
+        mid = QHBoxLayout()
+        mid.setContentsMargins(0, 0, 0, 0)
+        self.nav = QListWidget()
+        self.nav.setFixedWidth(170)
+        self.nav.setIconSize(QSize(18, 18))
+        self.stack = QStackedWidget()
+        mid.addWidget(self.nav)
+        mid.addWidget(self.stack, 1)
+        outer.addLayout(mid, 1)
+
+        bar = QFrame()
+        bar.setFrameShape(QFrame.Shape.StyledPanel)
+        bb = QHBoxLayout(bar)
+        self.dirty_lab = QLabel("")
+        self.revert_btn, self.apply_btn = QPushButton("Revert"), QPushButton("Apply")
+        self.apply_btn.setDefault(True)
+        bb.addWidget(self.dirty_lab, 1)
+        bb.addWidget(self.revert_btn)
+        bb.addWidget(self.apply_btn)
+        outer.addWidget(bar)
+        self.bar = bar
+        self.setCentralWidget(root)
+        self.status = self.statusBar()
+
+        self.live = LivePage(ctx, daemon, self)
+        self.profiles = ProfilesPage(ctx, daemon)
+        self.priority = PriorityPage(ctx, daemon)
+        self.triggers = TriggersPage(ctx, daemon)
+        self.schedule = SchedulePage(ctx, daemon)
+        self.timing = TimingPage(ctx, daemon)
+        self.advanced = AdvancedPage(ctx, daemon, self)
+        self.logpage = LogPage(daemon)
+        self.pages = [("Live", self.live), ("Profiles", self.profiles), ("Priority", self.priority),
+                      ("Triggers", self.triggers), ("Schedule", self.schedule), ("Timing", self.timing),
+                      ("Advanced", self.advanced), ("Log", self.logpage)]
+        for name, page in self.pages:
+            self.nav.addItem(name)
+            self.stack.addWidget(page)
+            if page.editable:
+                page.changed.connect(self.mark_dirty)
+        self.nav.currentRowChanged.connect(self._page_changed)
+        self.nav.setCurrentRow(0)
+        self.apply_btn.clicked.connect(self.apply)
+        self.revert_btn.clicked.connect(self.revert)
+
+        daemon.state.connect(self.on_state)
+        daemon.availability.connect(self.on_availability)
+        self.advanced.sync_prefs(prefs)
+        self.on_availability(daemon.alive)
+        self.mark_dirty(False)
+
+    # --- daemon connection ----------------------------------------------------------------
+    def on_availability(self, alive):
+        self.banner.setVisible(not alive)
+        self.advanced.refresh_system()
+        if alive:
+            self.fetch_config()
+            self.daemon.call("Status", cb=lambda ok, js: ok and self.on_state(json.loads(js)))
+            self.daemon.call_json("History", lambda ok, lines: ok and self.logpage.set_history(lines))
+        else:
+            self.live.dot.setPixmap(profile_pixmap(None, 64))
+            self.live.now.setText("Daemon offline")
+            self.live.why.setText("")
+            self.live.applied.setText("")
+            self.update_tray(None)
+
+    def fetch_config(self):
+        def got(ok, cfg):
+            if not ok:
+                return self.flash(f"Could not read the daemon config: {cfg}")
+            self.values = cfg["values"]
+            self.defaults = cfg["defaults"]
+            self.config_path = cfg["path"]
+            self.revert()
+        self.daemon.call_json("Config", got)
+
+    def on_state(self, s):
+        self.state = s
+        self.live.set_state(s)
+        self.update_tray(s)
+        if self.config_version is None:
+            self.config_version = s.get("config")
+        elif s.get("config") != self.config_version:  # edited by hand, or by a second GUI
+            self.config_version = s.get("config")
+            if not self.dirty:
+                self.fetch_config()
+
+    # --- editing ----------------------------------------------------------------------------
+    def _page_changed(self, row):
+        self.stack.setCurrentIndex(row)
+        self.bar.setVisible(self.pages[row][1].editable)
+        if self.pages[row][0] == "Advanced":
+            self.advanced.refresh_system()
+
+    def mark_dirty(self, dirty=True):
+        self.dirty = bool(dirty)
+        self.apply_btn.setEnabled(self.dirty)
+        self.revert_btn.setEnabled(self.dirty)
+        self.dirty_lab.setText("Unsaved changes" if self.dirty else "")
+
+    def collect(self):
+        vals = copy.deepcopy(self.values)
+        for _n, page in self.pages:
+            if page.editable:
+                page.dump(vals)
+        return vals
+
+    def revert(self):
+        v = dict(self.values)
+        v["__defaults__"] = self.defaults
+        v["__path__"] = self.config_path
+        for _n, page in self.pages:
+            if page.editable:
+                page.load(v)
+        self.mark_dirty(False)
+
+    def apply(self):
+        vals = self.collect()
+        overrides = {k: val for k, val in vals.items() if val != self.defaults.get(k)}
+        self.save_overrides(overrides)
+
+    def save_overrides(self, overrides):
+        self.write_raw(dump_toml(overrides).encode())
+
+    def write_raw(self, raw):
+        path = self.config_path
+        if not path:
+            return self.flash("Daemon not connected, cannot find the config file")
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    old = f.read()
+                if CONFIG_HEADER.splitlines()[0].encode() not in old and old.strip():
+                    with open(path + ".bak", "wb") as b:  # a hand-written file: keep a copy of it once
+                        b.write(old)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".config-", suffix=".toml")
+            with os.fdopen(fd, "wb") as f:
+                f.write(raw)
+            os.replace(tmp, path)
+        except OSError as e:
+            return self.flash(f"Could not save: {e}")
+        self.daemon.call("Reload", cb=lambda ok, p: (self.flash("Saved and applied" if ok else f"Saved, but the daemon is not answering: {p}"),
+                                                     ok and self.fetch_config()))
+
+    def flash(self, text):
+        self.status.showMessage(text, 6000)
+
+    def set_pref(self, key, value):
+        self.prefs[key] = value
+        save_prefs(self.prefs)
+        if self.tray:
+            self.update_tray(self.state)
+
+    # --- tray ---------------------------------------------------------------------------------
+    def attach_tray(self, tray):
+        self.tray = tray
+        self.menu = QMenu()
+        tray.setContextMenu(self.menu)
+        tray.activated.connect(lambda r: r in (QSystemTrayIcon.ActivationReason.Trigger,) and self.toggle())
+        self.ctx.changed.connect(lambda: self.update_tray(self.state))
+        self.update_tray(self.state)
+        tray.show()
+
+    def toggle(self):
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self.bring_up()
+
+    def bring_up(self):
+        self.show()
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.raise_()
+        self.activateWindow()
+
+    def update_tray(self, s):
+        if not self.tray:
+            return
+        target = (s or {}).get("target")
+        self.tray.setIcon(profile_icon(target if self.prefs["tray_color"] else "rainbow") if s else profile_icon(None))
+        if s:
+            why = REASONS.get(s.get("reason"), s.get("reason", ""))
+            self.tray.setToolTip(f"RGB: {target}\nbecause {why}")
+        else:
+            self.tray.setToolTip("RGB Controller: daemon not running")
+        m = self.menu
+        m.clear()
+        head = m.addAction(profile_icon(target), f"{target}" if s else "Daemon not running")
+        head.setEnabled(False)
+        m.addAction("Open RGB Controller", self.bring_up)
+        m.addSeparator()
+        if s:
+            pin_menu = m.addMenu("Pin a profile")
+            for name in self.ctx.profiles:
+                sub = pin_menu.addMenu(profile_icon(name), name)
+                for label, secs in PIN_DURATIONS[:1] + PIN_DURATIONS[2:5]:
+                    sub.addAction(label, lambda n=name, sc=secs: self.daemon.call("Pin", n, sc))
+            if "Off" in self.ctx.profiles:
+                m.addAction("Lights off for 1 hour", lambda: self.daemon.call("Pin", "Off", 3600))
+            pinned = bool(s["sources"].get("pin", {}).get("profile"))
+            un = m.addAction("Unpin", lambda: self.daemon.call("Unpin"))
+            un.setEnabled(pinned)
+            m.addSeparator()
+        else:
+            m.addAction("Start the daemon", lambda: self.advanced.systemctl("start"))
+            m.addSeparator()
+        m.addAction("Open OpenRGB", lambda: QProcess.startDetached("openrgb", []))
+        m.addAction("Quit this window (daemon keeps running)", self.app.quit)
+
+    # --- closing --------------------------------------------------------------------------------
+    def closeEvent(self, ev):
+        if self.tray and self.tray.isVisible() and self.prefs["close_to_tray"]:
+            ev.ignore()
+            self.hide()
+            if not self.prefs["told_about_tray"]:
+                self.prefs["told_about_tray"] = True
+                save_prefs(self.prefs)
+                self.tray.showMessage("RGB Controller", "Still running in the tray. The daemon keeps switching your lights "
+                                      "even if you quit this window.", QSystemTrayIcon.MessageIcon.Information, 6000)
+        else:
+            ev.accept()
+            self.app.quit()
+
+
+def main(argv=None):
+    argv = list(sys.argv if argv is None else argv)
+    start_hidden = "--tray" in argv
+    app = QApplication(argv)
+    app.setApplicationName("RGB Controller")
+    app.setDesktopFileName(APP_ID)
+    app.setQuitOnLastWindowClosed(False)
+
+    # single instance: a second launch just raises the first window
+    sock_name = f"{APP_ID}-{os.getuid()}"
+    probe = QLocalSocket()
+    probe.connectToServer(sock_name)
+    if probe.waitForConnected(300):
+        probe.write(b"show")
+        probe.flush()
+        probe.waitForBytesWritten(300)
+        return 0
+    QLocalServer.removeServer(sock_name)
+    server = QLocalServer()
+    server.listen(sock_name)
+
+    prefs = load_prefs()
+    daemon = DaemonClient()
+    ctx = Ctx()
+    win = Window(app, daemon, ctx, prefs)
+    server.newConnection.connect(lambda: (server.nextPendingConnection().deleteLater(), win.bring_up()))
+    if QSystemTrayIcon.isSystemTrayAvailable():
+        win.attach_tray(QSystemTrayIcon())
+    else:
+        start_hidden = False
+    if not start_hidden:
+        win.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
