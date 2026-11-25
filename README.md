@@ -5,7 +5,7 @@ Event-driven OpenRGB profile switcher for Linux. Zero idle CPU, fully configurab
 > [!CAUTION]
 > **Disclaimer: Vibecoded Project**
 > 
-> This was built largely on vibes and tested just enough for my own personal setup. It works well for me, though you'll probably run into bugs, weird edge cases, and general jank. Take it as-is if it's useful to you, just don't rely on it for anything that actually matters.
+> This was built largely on vibes and tested just enough for my own personal setup. It works well for me, though you'll probably run into bugs, weird edge cases, and general jank. Feel free to use it as-is. And if you spot an issue, open a report and I might get around to fixing it. Just don't rely on it for anything that actually matters.
 
 ## Features
 
