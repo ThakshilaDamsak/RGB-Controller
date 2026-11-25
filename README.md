@@ -34,32 +34,32 @@ Event-driven OpenRGB profile switcher for Linux. Zero idle CPU, fully configurab
 │       │             │             │              │         │
 │       └─────────────┴──────┬──────┴──────────────┘         │
 │                            ▼                               │
-│              ┌───────────────────────┐                     │
-│              │   Priority Evaluator  │                     │
-│              │  (first match wins)   │                     │
-│              └───────────┬───────────┘                     │
-│                          ▼                                 │
-│              ┌───────────────────────┐                     │
-│              │    Profile Runner     │                     │
-│              │ (openrgb --profile X) │                     │
-│              │  retries, timeouts    │                     │
-│              └───────────────────────┘                     │
+│               ┌───────────────────────┐                    │
+│               │   Priority Evaluator  │                    │
+│               │  (first match wins)   │                    │
+│               └───────────┬───────────┘                    │
+│                           ▼                                │
+│               ┌───────────────────────┐                    │
+│               │    Profile Runner     │                    │
+│               │ (openrgb --profile X) │                    │
+│               │  retries, timeouts    │                    │
+│               └───────────────────────┘                    │
 └────────────────────────────────────────────────────────────┘
                             ▲
               ┌─────────────┴─────────────┐
               ▼                           ▼
-    ┌───────────────────┐        ┌────────────────────┐
-    │   rgbctl (CLI)    │        │ rgb-controller-gui │
-    │  status, pin,     │        │  (Qt6, tray,       │
-    │  hold, run, log   │        │   live view)       │
-    └───────────────────┘        └────────────────────┘
+    ┌───────────────────┐      ┌────────────────────┐
+    │   rgbctl (CLI)    │      │ rgb-controller-gui │
+    │  status, pin,     │      │  (Qt6, tray,       │
+    │  hold, run, log   │      │   live view)       │
+    └───────────────────┘      └────────────────────┘
               ▲                           ▲
               │                           │
-    ┌─────────┴──────────┐       ┌────────┴──────────┐
-    │  game-rgb (Lutris) │       │  rgb-loading.fish │
-    │  start / stop      │       │  pacman, paru,    │
-    │  hold for PID      │       │  yay, etc.        │
-    └────────────────────┘       └───────────────────┘
+    ┌─────────┴──────────┐      ┌─────────┴─────────┐
+    │  game-rgb (Lutris) │      │  rgb-loading.fish │
+    │  start / stop      │      │  pacman, paru,    │
+    │  hold for PID      │      │  yay, etc.        │
+    └────────────────────┘      └───────────────────┘
 ```
 
 ## Installation
