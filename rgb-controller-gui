@@ -584,6 +584,35 @@ class Card(QFrame):
         super().paintEvent(ev)
 
 
+def boxed(widget, margin=2):
+    """Put a list / tree / table / text view inside a bordered Card so every view shares one outline."""
+    if isinstance(widget, QFrame):
+        widget.setFrameShape(QFrame.Shape.NoFrame)
+    card = Card()
+    lay = QVBoxLayout(card)
+    lay.setContentsMargins(margin, margin, margin, margin)
+    lay.setSpacing(0)
+    lay.addWidget(widget)
+    return card
+
+
+def card_section(title, sub, *items):
+    """Heading plus one bordered Card holding widgets / layouts, with consistent padding."""
+    box = QWidget()
+    v = QVBoxLayout(box)
+    v.setContentsMargins(0, 0, 0, 0)
+    v.setSpacing(8)
+    v.addWidget(heading(title, sub))
+    card = Card()
+    cl = QVBoxLayout(card)
+    cl.setContentsMargins(16, 14, 16, 14)
+    cl.setSpacing(10)
+    for it in items:
+        cl.addLayout(it) if isinstance(it, QLayout) else cl.addWidget(it)
+    v.addWidget(card)
+    return box
+
+
 class InlineMessage(QFrame):
     """Inline banner in the spirit of KMessageWidget, tinted from the palette."""
 
@@ -857,7 +886,7 @@ class StringList(QWidget):
         row.addWidget(self.edit, 1)
         row.addWidget(add)
         row.addWidget(rem)
-        lay.addWidget(self.list)
+        lay.addWidget(boxed(self.list))
         lay.addLayout(row)
         add.clicked.connect(self._add)
         self.edit.returnPressed.connect(self._add)
@@ -1008,7 +1037,7 @@ class LivePage(FormPage):
         self.tree.setItemDelegate(RowHeightDelegate(30, self.tree))
         self.tree.setMinimumHeight(250)
         self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.body.addWidget(self.tree)
+        self.body.addWidget(boxed(self.tree))
         self.body.addStretch(1)
 
     def _result(self, ok, payload):
@@ -1224,7 +1253,7 @@ class PriorityPage(FormPage):
         self.list.setMinimumHeight(6 * 58 + 12)
         self.list.model().rowsMoved.connect(lambda *_: (self._renumber(), self.changed.emit()))
         self.list.itemChanged.connect(lambda _i: (self._renumber(), self.changed.emit()))
-        self.body.addWidget(self.list)
+        self.body.addWidget(boxed(self.list))
         row = QHBoxLayout()
         reset = push("Reset to default order", "edit-undo", "edit-reset")
         reset.clicked.connect(self._reset)
@@ -1321,7 +1350,7 @@ class TriggersPage(FormPage):
         self.rules.setAlternatingRowColors(True)
         self.rules.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.rules.setMinimumHeight(150)
-        self.body.addWidget(self.rules)
+        self.body.addWidget(boxed(self.rules))
         add = push("Add rule", "list-add")
         add.clicked.connect(lambda: (self._rule_row("", ""), self.changed.emit()))
         self.body.addWidget(add, 0, Qt.AlignmentFlag.AlignLeft)
@@ -1631,11 +1660,9 @@ class AdvancedPage(FormPage):
         self.daemon, self.window_ = daemon, window
         self.config_path = ""
 
-        self.body.addWidget(heading("How profiles are applied"))
         self.cmd = QLineEdit()
         self.cmd.setClearButtonEnabled(True)
         self.cmd.textChanged.connect(self.changed)
-        self.body.addWidget(self.cmd)
         plain = push("Plain openrgb")
         plain.clicked.connect(lambda: self.cmd.setText("openrgb"))
         srv = push("Use a running OpenRGB server (faster)", "network-server")
@@ -1643,11 +1670,11 @@ class AdvancedPage(FormPage):
         srv.clicked.connect(lambda: self.cmd.setText("openrgb --client localhost:6742"))
         test = push("Test", "dialog-ok-apply", "system-run")
         test.clicked.connect(self._test)
-        self.body.addWidget(button_flow(plain, srv, test))
-        self.body.addWidget(hint("The profile name is added as: <command> --profile NAME. A full device scan per switch can take a "
-                                 "second or two; with a server running it is instant."))
+        self.body.addWidget(card_section(
+            "How profiles are applied", "", self.cmd, button_flow(plain, srv, test),
+            hint("The profile name is added as: <command> --profile NAME. A full device scan per switch can take a "
+                 "second or two; with a server running it is instant.")))
 
-        self.body.addWidget(heading("Daemon"))
         srow = QHBoxLayout()
         srow.setSpacing(8)
         self.dstate_icon = QLabel()
@@ -1655,36 +1682,30 @@ class AdvancedPage(FormPage):
         self.dstate = QLabel("…")
         srow.addWidget(self.dstate_icon)
         srow.addWidget(self.dstate, 1)
-        self.body.addLayout(srow)
-        row = QHBoxLayout()
+        btns = []
         for text, act, ic in (("Start", "start", ("media-playback-start",)), ("Stop", "stop", ("media-playback-stop",)),
                               ("Restart", "restart", ("view-refresh",))):
             b = push(text, *ic)
             b.clicked.connect(lambda _c=False, a=act: self.systemctl(a))
-            row.addWidget(b)
-        row.addStretch(1)
-        self.body.addLayout(row)
+            btns.append(b)
         self.d_enabled = QCheckBox("Start the daemon at login")
         self.d_enabled.clicked.connect(lambda on: self.systemctl("enable" if on else "disable"))
-        self.body.addWidget(self.d_enabled)
-        self.body.addWidget(hint("Closing this window never stops the daemon. Stopping it here leaves your lights as they are."))
+        self.body.addWidget(card_section(
+            "Daemon", "", srow, button_flow(*btns), self.d_enabled,
+            hint("Closing this window never stops the daemon. Stopping it here leaves your lights as they are.")))
 
-        self.body.addWidget(heading("This window"))
         self.close_tray = QCheckBox("Closing the window keeps it in the tray")
         self.tray_color = QCheckBox("Tray icon takes the colour of the current profile")
         self.autostart = QCheckBox("Start in the tray at login")
         for c, key in ((self.close_tray, "close_to_tray"), (self.tray_color, "tray_color")):
             c.clicked.connect(lambda on, k=key: window.set_pref(k, on))
-            self.body.addWidget(c)
         self.autostart.clicked.connect(self._autostart)
-        self.body.addWidget(self.autostart)
+        self.body.addWidget(card_section("This window", "", self.close_tray, self.tray_color, self.autostart))
 
-        self.body.addWidget(heading("Config file"))
         self.path_lab = QLabel("")
         self.path_lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.path_lab.setWordWrap(True)
-        self.body.addWidget(self.path_lab)
-        btns = []
+        fbtns = []
         for text, ic, fn in (("Open file", ("document-open",), self._open_file),
                              ("Open folder", ("folder-open",), self._open_dir),
                              ("Export…", ("document-export", "document-save-as"), self._export),
@@ -1692,10 +1713,11 @@ class AdvancedPage(FormPage):
                              ("Reset everything to defaults", ("edit-reset", "edit-undo"), self._reset)):
             b = push(text, *ic)
             b.clicked.connect(fn)
-            btns.append(b)
-        self.body.addWidget(button_flow(*btns))
-        self.body.addWidget(hint("The file only lists what differs from the built-in defaults, and the daemon applies edits the "
-                                 "moment the file is saved, whether they come from here or from your editor."))
+            fbtns.append(b)
+        self.body.addWidget(card_section(
+            "Config file", "", self.path_lab, button_flow(*fbtns),
+            hint("The file only lists what differs from the built-in defaults, and the daemon applies edits the "
+                 "moment the file is saved, whether they come from here or from your editor.")))
         self.body.addStretch(1)
         self.refresh_system()
 
@@ -1821,7 +1843,9 @@ class LogPage(Page):
         self.view.setReadOnly(True)
         self.view.setMaximumBlockCount(2000)
         self.view.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
-        lay.addWidget(self.view, 1)
+        lay.addWidget(boxed(self.view), 1)
+        self.count = dim(QLabel(""))
+        lay.addWidget(self.count)
         self.lines = []
         daemon.logline.connect(self.add)
 
@@ -1833,6 +1857,7 @@ class LogPage(Page):
         self.lines = self.lines[-2000:]
         if self._matches(line):
             self.view.appendPlainText(line)
+        self._count()
 
     def set_history(self, lines):
         self.lines = list(lines)
@@ -1841,10 +1866,16 @@ class LogPage(Page):
     def _refilter(self):
         self.view.setPlainText("\n".join(l for l in self.lines if self._matches(l)))
         self.view.verticalScrollBar().setValue(self.view.verticalScrollBar().maximum())
+        self._count()
+
+    def _count(self):
+        shown = sum(1 for l in self.lines if self._matches(l))
+        self.count.setText(f"{shown} of {len(self.lines)} lines")
 
     def _clear(self):
         self.lines = []
         self.view.clear()
+        self._count()
 
 
 # ═══════════════════════════════ main window ═══════════════════════════════
@@ -1883,29 +1914,27 @@ class Window(QMainWindow):
 
         # sidebar: navigation + live status chip
         side = QWidget()
-        side.setFixedWidth(210)
+        side.setFixedWidth(180)
         sl = QVBoxLayout(side)
-        sl.setContentsMargins(0, 0, 0, 0)
-        sl.setSpacing(0)
+        sl.setContentsMargins(8, 8, 0, 8)
+        sl.setSpacing(8)
         self.nav = QListWidget()
         self.nav.setFrameShape(QFrame.Shape.NoFrame)
-        self.nav.setIconSize(QSize(22, 22))
+        self.nav.setIconSize(QSize(18, 18))
         self.nav.setSpacing(1)
         self.nav.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.nav.viewport().setBackgroundRole(QPalette.ColorRole.Window)
-        sl.addWidget(self.nav, 1)
-        sl.addWidget(hline())
+        self.nav.viewport().setBackgroundRole(QPalette.ColorRole.Base)
+        sl.addWidget(boxed(self.nav), 1)
         self.side_status = QToolButton()
         self.side_status.setAutoRaise(True)
-        self.side_status.setIconSize(QSize(24, 24))
+        self.side_status.setIconSize(QSize(18, 18))
         self.side_status.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.side_status.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.side_status.setMinimumHeight(48)
+        self.side_status.setMinimumHeight(36)
         self.side_status.setToolTip("Show the Live page")
         self.side_status.clicked.connect(lambda: self.nav.setCurrentRow(0))
-        sl.addWidget(self.side_status)
+        sl.addWidget(boxed(self.side_status))
         mid.addWidget(side)
-        mid.addWidget(vline())
 
         self.stack = QStackedWidget()
         mid.addWidget(self.stack, 1)
@@ -1950,7 +1979,7 @@ class Window(QMainWindow):
                       ("Log", self.logpage, ("text-x-log", "view-list-text", "utilities-log-viewer"))]
         for name, page, ic in self.pages:
             it = QListWidgetItem(icon(*ic), name)
-            it.setSizeHint(QSize(0, 42))
+            it.setSizeHint(QSize(0, 34))
             self.nav.addItem(it)
             self.stack.addWidget(page)
             if page.editable:
