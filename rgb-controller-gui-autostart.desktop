@@ -6,3 +6,5 @@ Exec=rgb-controller-gui --tray
 Icon=rgb-controller
 Terminal=false
 X-GNOME-Autostart-enabled=true
+StartupNotify=false
+X-KDE-StartupNotify=false

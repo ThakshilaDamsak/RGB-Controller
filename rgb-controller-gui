@@ -1741,7 +1741,7 @@ class AdvancedPage(FormPage):
                                     else icon("dialog-warning")).pixmap(QSize(16, 16)))
 
     def _autostart_path(self):
-        return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "autostart", "rgb-controller-gui.desktop")
+        return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "autostart", "rgb-controller-gui-autostart.desktop")
 
     def _autostart(self, on):
         path = self._autostart_path()
@@ -1750,7 +1750,7 @@ class AdvancedPage(FormPage):
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "w") as f:
                     f.write("[Desktop Entry]\nType=Application\nName=RGB Controller (tray)\nExec=rgb-controller-gui --tray\n"
-                            "Icon=rgb-controller\nTerminal=false\nX-GNOME-Autostart-enabled=true\n")
+                            "Icon=rgb-controller\nTerminal=false\nX-GNOME-Autostart-enabled=true\nStartupNotify=false\n")
             elif os.path.exists(path):
                 os.remove(path)
         except OSError as e:
