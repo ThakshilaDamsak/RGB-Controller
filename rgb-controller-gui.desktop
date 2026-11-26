@@ -9,3 +9,5 @@ Terminal=false
 Categories=Settings;HardwareSettings;
 Keywords=rgb;openrgb;lighting;profiles;
 StartupWMClass=rgb-controller-gui
+StartupNotify=false
+X-KDE-StartupNotify=false

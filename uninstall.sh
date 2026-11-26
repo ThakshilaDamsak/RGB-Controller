@@ -26,7 +26,7 @@ if [ -n "${SUDO_USER:-}" ]; then
     sudo -u "$SUDO_USER" systemctl --user disable rgb-controller.service 2>/dev/null || true
     # Remove GUI autostart
     USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-    sudo -u "$SUDO_USER" rm -f "$USER_HOME/.config/autostart/rgb-controller-gui-autostart.desktop" 2>/dev/null || true
+    sudo -u "$SUDO_USER" rm -f "$USER_HOME/.config/autostart/rgb-controller-gui-autostart.desktop" "$USER_HOME/.config/autostart/rgb-controller-gui.desktop" 2>/dev/null || true
 fi
 
 # Remove binaries
