@@ -43,7 +43,6 @@ rm -f "$SYSTEMD_USER_DIR/rgb-controller.service"
 # Remove desktop files
 echo "Removing desktop entries..."
 rm -f "$DESKTOP_DIR/rgb-controller-gui.desktop"
-rm -f "$DESKTOP_DIR/rgb-controller-gui-autostart.desktop"
 
 # Remove icon
 echo "Removing icon..."

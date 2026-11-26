@@ -1741,20 +1741,20 @@ class AdvancedPage(FormPage):
                                     else icon("dialog-warning")).pixmap(QSize(16, 16)))
 
     def _autostart_path(self):
-        return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "autostart", "rgb-controller-gui-autostart.desktop")
+        return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "autostart", "rgb-controller-gui.desktop")
 
     def _autostart(self, on):
         path = self._autostart_path()
-        stale = os.path.join(os.path.dirname(path), "rgb-controller-gui.desktop")
+        stale = os.path.join(os.path.dirname(path), "rgb-controller-gui-autostart.desktop")
         try:
             if os.path.exists(stale):
                 os.remove(stale)
             if on:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "w") as f:
-                    f.write("[Desktop Entry]\nType=Application\nName=RGB Controller (tray)\nExec=rgb-controller-gui --tray\n"
-                            "Icon=rgb-controller\nTerminal=false\nX-GNOME-Autostart-enabled=true\nStartupNotify=false\n"
-                            "X-KDE-StartupNotify=false\n")
+                    f.write("[Desktop Entry]\nType=Application\nName=RGB Controller\nExec=rgb-controller-gui --tray\n"
+                            "Icon=rgb-controller\nTerminal=false\nCategories=Settings;HardwareSettings;\n"
+                            "X-GNOME-Autostart-enabled=true\nStartupNotify=false\nX-KDE-StartupNotify=false\n")
             elif os.path.exists(path):
                 os.remove(path)
         except OSError as e:

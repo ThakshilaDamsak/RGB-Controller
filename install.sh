@@ -41,7 +41,6 @@ sed "s|@BIN@|$BIN_DIR|g" "$SCRIPT_DIR/rgb-controller.service" > "$SYSTEMD_USER_D
 # Install desktop files
 echo "Installing desktop entries..."
 install -m 644 "$SCRIPT_DIR/rgb-controller-gui.desktop" "$DESKTOP_DIR/rgb-controller-gui.desktop"
-install -m 644 "$SCRIPT_DIR/rgb-controller-gui-autostart.desktop" "$DESKTOP_DIR/rgb-controller-gui-autostart.desktop"
 
 # Install icon (use the SVG as scalable icon)
 echo "Installing icon..."
@@ -65,10 +64,11 @@ if [ -n "${SUDO_USER:-}" ]; then
     echo "Enabling service for user $SUDO_USER..."
     sudo -u "$SUDO_USER" systemctl --user enable rgb-controller.service 2>/dev/null || true
     sudo -u "$SUDO_USER" systemctl --user start rgb-controller.service 2>/dev/null || true
-    # Enable GUI autostart
+    # Enable GUI autostart (regular desktop entry with --tray)
     USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
     sudo -u "$SUDO_USER" mkdir -p "$USER_HOME/.config/autostart"
-    sudo -u "$SUDO_USER" cp "$SCRIPT_DIR/rgb-controller-gui-autostart.desktop" "$USER_HOME/.config/autostart/rgb-controller-gui-autostart.desktop" 2>/dev/null || true
+    sed 's|^Exec=rgb-controller-gui$|Exec=rgb-controller-gui --tray|' "$SCRIPT_DIR/rgb-controller-gui.desktop" > "$USER_HOME/.config/autostart/rgb-controller-gui.desktop"
+    chown "$SUDO_USER" "$USER_HOME/.config/autostart/rgb-controller-gui.desktop"
 fi
 
 echo ""

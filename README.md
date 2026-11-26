@@ -91,7 +91,6 @@ sed 's|@BIN@|/usr/local/bin|g' rgb-controller.service | sudo tee /usr/lib/system
 
 # Desktop entries
 sudo install -m 644 rgb-controller-gui.desktop /usr/share/applications/
-sudo install -m 644 rgb-controller-gui-autostart.desktop /usr/share/applications/
 
 # Icon
 sudo install -m 644 rgb-controller.svg /usr/share/icons/hicolor/scalable/apps/rgb-controller.svg
@@ -104,9 +103,9 @@ sudo install -m 644 rgb-loading.fish /usr/share/fish/vendor_conf.d/
 systemctl --user daemon-reload
 systemctl --user enable --now rgb-controller.service
 
-# GUI autostart
+# GUI autostart (regular desktop entry with --tray)
 mkdir -p ~/.config/autostart
-cp rgb-controller-gui-autostart.desktop ~/.config/autostart/
+sed 's|^Exec=rgb-controller-gui$|Exec=rgb-controller-gui --tray|' rgb-controller-gui.desktop > ~/.config/autostart/rgb-controller-gui.desktop
 ```
 
 ### Requirements
