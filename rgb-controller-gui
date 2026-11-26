@@ -26,7 +26,7 @@ import sys
 import tempfile
 from functools import lru_cache
 
-from PySide6.QtCore import QObject, QPoint, QProcess, QRect, QRectF, QSize, Qt, QTime, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QPoint, QProcess, QRect, QRectF, QSize, Qt, QTime, QTimer, QUrl, Signal, Slot
 from PySide6.QtDBus import QDBusConnection, QDBusMessage, QDBusPendingCallWatcher, QDBusServiceWatcher
 from PySide6.QtGui import (
     QAction, QBrush, QColor, QConicalGradient, QDesktopServices, QFont, QFontDatabase, QIcon, QPainter, QPalette,
@@ -2175,8 +2175,18 @@ def main(argv=None):
     ctx = Ctx()
     win = Window(app, daemon, ctx, prefs)
     server.newConnection.connect(lambda: (server.nextPendingConnection().deleteLater(), win.bring_up()))
+    tray_requested = "--tray" in argv
     if QSystemTrayIcon.isSystemTrayAvailable():
         win.attach_tray(QSystemTrayIcon())
+    elif tray_requested:
+        # At early login the tray may not be ready yet; keep hidden and attach once it is.
+        def try_attach_tray():
+            if win.tray is None and QSystemTrayIcon.isSystemTrayAvailable():
+                win.attach_tray(QSystemTrayIcon())
+                timer.stop()
+        timer = QTimer()
+        timer.timeout.connect(try_attach_tray)
+        timer.start(1000)
     else:
         start_hidden = False
     if not start_hidden:
