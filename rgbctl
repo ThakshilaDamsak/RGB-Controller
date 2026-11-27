@@ -9,6 +9,7 @@
 #   rgbctl hold SOURCE TOKEN [PID]   hold/release a state by hand (SOURCE: loading, gaming)
 #   rgbctl release SOURCE TOKEN
 #   rgbctl run SOURCE -- CMD ARGS... hold SOURCE for as long as CMD runs (what the Fish wrapper uses)
+#   rgbctl watch SOURCE -- CMD ARGS... open a /proc watch window while CMD runs (cachy-update inner pacman)
 #   rgbctl gui                       open the GUI
 
 SVC=org.rgbcontroller.Daemon
@@ -85,8 +86,25 @@ for name, d in s["sources"].items():
         release
         exit "$rc"
         ;;
+    watch)
+        src=${2:-}
+        [ -n "$src" ] || { echo "usage: rgbctl watch SOURCE -- CMD ARGS..." >&2; exit 2; }
+        shift 2
+        [ "${1:-}" = "--" ] && shift
+        [ $# -gt 0 ] || { echo "rgbctl watch: no command given" >&2; exit 2; }
+        tok="$src-$$"
+        # The window is tied to this shell's pid: if we are killed, the daemon notices and lets go.
+        quiet Watch ssu "$src" "$tok" "$$" || true
+        unwatch() { quiet Unwatch ss "$src" "$tok" || true; }
+        trap : INT # let the child handle Ctrl-C; we unwatch afterwards
+        trap 'unwatch; exit 143' TERM HUP
+        "$@"
+        rc=$?
+        unwatch
+        exit "$rc"
+        ;;
     gui) exec rgb-controller-gui "$@" ;;
-    -h | --help | help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+    -h | --help | help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
     *)
         echo "rgbctl: unknown command '$1' (try: rgbctl help)" >&2
         exit 2

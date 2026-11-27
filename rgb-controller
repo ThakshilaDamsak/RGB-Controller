@@ -100,6 +100,8 @@ WATCH_JOBVIEW = True                 # KDE job views (Dolphin copies, Discover, 
 WATCH_LAUNCHER = True                # taskbar progress (com.canonical.Unity.LauncherEntry: browsers, installers...)
 WATCH_NOTIFICATIONS = True           # notifications carrying a progress "value" hint
 IGNORE_NOTIFICATION_APPS = ()        # app_name values to ignore, e.g. ("Spotify",)
+WATCH_PROC_PACMAN = True               # watch for the real pacman inside cachy-update (proc scan while a watch window is open)
+PROC_SCAN_MS = 500                     # /proc scan cadence (ms) while a watch window is open
 # ═════════════════════════════ END CONFIG ═════════════════════════════
 
 _TUNABLES = sorted(k for k, v in list(globals().items()) if k.isupper() and not k.startswith("_"))
@@ -219,6 +221,15 @@ INTROSPECTION = f"""
       <arg type="u" name="pid" direction="in"/>
     </method>
     <method name="Release">
+      <arg type="s" name="source" direction="in"/>
+      <arg type="s" name="token" direction="in"/>
+    </method>
+    <method name="Watch">
+      <arg type="s" name="source" direction="in"/>
+      <arg type="s" name="token" direction="in"/>
+      <arg type="u" name="pid" direction="in"/>
+    </method>
+    <method name="Unwatch">
       <arg type="s" name="source" direction="in"/>
       <arg type="s" name="token" direction="in"/>
     </method>
@@ -454,6 +465,12 @@ class Source:
 
     def release(self, token):
         raise KeyError(f"{self.name} does not take holds")
+
+    def watch(self, token, pid):
+        raise KeyError(f"{self.name} does not take watches")
+
+    def unwatch(self, token):
+        raise KeyError(f"{self.name} does not take watches")
 
 
 class ACSource(Source):
@@ -1020,6 +1037,10 @@ class LoadingSource(HoldSource):
         self.rules = ()
         self.notif_watch = 0
         self.confirmed = False
+        self.running = False  # start()/stop() (monitoring) state; proc scan only runs while true
+        self.windows = {}    # token -> {"fd": int, "src": int, "ttl": int} (cachy-update watch windows)
+        self.proc_item = None  # synthetic ("proc", pid) item currently lit by the scan, or None
+        self.scan = Timer(self._scan)
         self.grace = Timer(self._confirm)
         self.linger = Timer(self._unconfirm)
         self.gc = Timer(self._gc)
@@ -1042,8 +1063,10 @@ class LoadingSource(HoldSource):
         return tuple(rules)
 
     def start(self):
+        self.running = True
         rules = self._rules()
         if not rules or self.mon:  # an empty rule list would mean "everything", never do that
+            self._scan_kick()
             return
         try:
             addr = Gio.dbus_address_get_for_bus_sync(Gio.BusType.SESSION, None)
@@ -1060,6 +1083,7 @@ class LoadingSource(HoldSource):
             )
         except GLib.Error as e:
             log.warning("loading: cannot monitor the session bus (%s); only explicit holds will work", e.message)
+            self._scan_kick()
             return
         self.mon = conn
         self.rules = rules
@@ -1068,8 +1092,11 @@ class LoadingSource(HoldSource):
                 self.ctl.session, NOTIFICATIONS, Gio.BusNameWatcherFlags.NONE, None, self._notif_gone
             )
         log.info("loading: monitoring progress bars")
+        self._scan_kick()
 
     def stop(self):
+        self.running = False
+        self._scan_kick()  # cancel the scan and drop the synthetic proc item; windows are kept for resume
         mon, self.mon = self.mon, None
         if mon:
             try:
@@ -1094,6 +1121,8 @@ class LoadingSource(HoldSource):
         if self.mon and self._rules() != self.rules:
             self.stop()
             self.start()
+        else:
+            self._scan_kick()  # pick up a watch_proc_pacman / proc_scan_ms change without a restart
 
     def wanted(self):
         return PROFILE_LOADING if self.confirmed else None
@@ -1103,6 +1132,8 @@ class LoadingSource(HoldSource):
             "confirmed": self.confirmed,
             "progress": sorted(" ".join(map(str, k)) for k in self.items),
             "holds": sorted(self.holds),
+            "windows": sorted(self.windows),
+            "proc": self.proc_item,
         }
 
     # --- state ------------------------------------------------------------
@@ -1175,6 +1206,194 @@ class LoadingSource(HoldSource):
         self._activity()
         if self.items:
             self.gc.start(PROGRESS_STALE_S * 500)
+
+    # --- watch windows (cachy-update: light Loading only while the inner pacman runs) ---
+    _QUERY_LONG = frozenset({
+        "--search", "--info", "--list", "--groups", "--print", "--print-format",
+        "--query", "--files", "--deptest", "--version", "--help",
+    })
+    # global options that consume the following token as their value (e.g. `pacman --color auto -Syu`)
+    _VALUE_OPTS = frozenset({
+        "--color", "--config", "--dbpath", "--logfile", "--root",
+        "--cachedir", "--hookdir", "--gpgdir", "--arch",
+    })
+    _OPS = {
+        "--sync": "sync", "--upgrade": "upgrade", "--remove": "remove",
+        "--database": "database", "--build": "build",
+        "S": "sync", "U": "upgrade", "R": "remove", "D": "database",
+        "Q": "query", "F": "files", "T": "deptest", "B": "build",
+    }
+
+    def watch(self, token, pid=0):
+        if not token or len(token) > 128 or (token not in self.windows and len(self.windows) >= 64):
+            raise ValueError("bad or too many tokens")
+        self._release_window(token)
+        entry = {"fd": -1, "src": 0, "ttl": 0}
+        if pid > 0:
+            try:
+                entry["fd"] = os.pidfd_open(pid)
+            except ProcessLookupError:
+                log.info("%s: watch %r ignored, pid %d already gone", self.name, token, pid)
+                return
+            except (AttributeError, OSError) as e:
+                log.debug("%s: no pidfd (%s), relying on explicit unwatch", self.name, e)
+            if entry["fd"] >= 0:
+                entry["src"] = GLib.unix_fd_add_full(
+                    GLib.PRIORITY_DEFAULT, entry["fd"], GLib.IOCondition.IN, self._window_exited, token
+                )
+        if entry["fd"] < 0 and HOLD_MAX_HOURS > 0:
+            entry["ttl"] = GLib.timeout_add_seconds(int(HOLD_MAX_HOURS * 3600), self._window_expired, token)
+        self.windows[token] = entry
+        log.info("%s: watch %r", self.name, token)
+        self._scan_kick()
+
+    def unwatch(self, token):
+        if token == "*":
+            for t in list(self.windows):
+                self._release_window(t)
+            self._scan_kick()
+            return
+        if self._release_window(token):
+            self._scan_kick()
+
+    def _release_window(self, token):
+        entry = self.windows.pop(token, None)
+        if not entry:
+            return False
+        if entry["src"]:
+            GLib.source_remove(entry["src"])
+        if entry["ttl"]:
+            GLib.source_remove(entry["ttl"])
+        if entry["fd"] >= 0:
+            os.close(entry["fd"])
+        log.info("%s: unwatch %r", self.name, token)
+        return True
+
+    def _window_exited(self, fd, condition, token):
+        entry = self.windows.get(token)
+        if entry:
+            entry["src"] = 0  # removed by returning SOURCE_REMOVE
+        self._release_window(token)
+        self._scan_kick()
+        return GLib.SOURCE_REMOVE
+
+    def _window_expired(self, token):
+        entry = self.windows.get(token)
+        if entry:
+            entry["ttl"] = 0
+        log.warning("%s: watch %r expired after %sh without an unwatch", self.name, token, HOLD_MAX_HOURS)
+        self._release_window(token)
+        self._scan_kick()
+        return GLib.SOURCE_REMOVE
+
+    def _scan_kick(self):
+        if WATCH_PROC_PACMAN and self.windows and self.running:
+            if not self.scan.pending:
+                self.scan.start(PROC_SCAN_MS)
+        else:
+            self.scan.cancel()
+            if self.proc_item is not None:
+                self._set_item(self.proc_item, "", False)
+                self.proc_item = None
+
+    def _scan(self):
+        pid = self._find_real_pacman()
+        key = ("proc", pid) if pid else None
+        if key != self.proc_item:
+            if self.proc_item is not None:
+                self._set_item(self.proc_item, "", False)
+            self.proc_item = key
+            if key is not None:
+                self._set_item(key, "", True)
+        if self.windows and self.running:
+            self.scan.start(PROC_SCAN_MS)
+
+    def _find_real_pacman(self):
+        try:
+            names = os.listdir("/proc")
+        except OSError:
+            return 0
+        for name in names:
+            if name.isdigit() and self._real_pacman(int(name)):
+                return int(name)
+        return 0
+
+    def _real_pacman(self, pid):
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                if f.read().strip() != "pacman":
+                    return False
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read()
+        except OSError:
+            return False
+        argv = [p.decode("utf-8", "replace") for p in raw.split(b"\0") if p]
+        if not self._pacman_modifies(argv):
+            return False
+        ppid = self._ppid(pid)  # reject fakeroot-driven pacman (makepkg / AUR builds)
+        for _ in range(8):
+            if ppid <= 1:
+                break
+            try:
+                with open(f"/proc/{ppid}/comm") as f:
+                    if f.read().strip() == "fakeroot":
+                        return False
+            except OSError:
+                break
+            ppid = self._ppid(ppid)
+        return True
+
+    @staticmethod
+    def _ppid(pid):
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                data = f.read()
+        except OSError:
+            return 0
+        rp = data.rfind(")")
+        if rp < 0:
+            return 0
+        fields = data[rp + 2:].split()
+        try:
+            return int(fields[1])
+        except (IndexError, ValueError):
+            return 0
+
+    def _pacman_modifies(self, argv):
+        args = argv[1:]
+        for a in args:
+            if a in self._QUERY_LONG:
+                return False
+        op = op_arg = None
+        targets = []
+        skip = False  # the previous token was a value-taking global option (--color, --config, ...)
+        for a in args:
+            if skip:
+                skip = False
+                continue
+            if a in self._VALUE_OPTS:
+                skip = True
+                continue
+            if a.startswith("-"):
+                if op is None:
+                    op_arg = a
+                    op = self._OPS.get(a) if a.startswith("--") else self._OPS.get(a[1:2])
+                    # an unknown option before the operation (e.g. --color, --noconfirm) is skipped:
+                    # cachy-update runs `pacman --color auto -Syu`, so the op is not the first token.
+            else:
+                targets.append(a)
+        if op in ("upgrade", "remove", "database", "build"):
+            return True
+        if op == "sync":
+            if op_arg.startswith("--"):
+                return bool(targets) or "--sysupgrade" in args
+            letters = op_arg[2:]
+            if any(c in "silgpc" for c in letters):
+                return False
+            if "u" in letters:
+                return True
+            return bool(targets)
+        return False
 
     # --- monitor connection (runs on GDBus' worker thread: parse, then hop to the main loop) ---
     def _filter(self, conn, msg, incoming, *_):
@@ -1337,6 +1556,14 @@ class Controller:
             elif method == "Release":
                 source, token = params.unpack()
                 self.all[source].release(token)
+                invocation.return_value(None)
+            elif method == "Watch":
+                source, token, pid = params.unpack()
+                self.all[source].watch(token, pid)
+                invocation.return_value(None)
+            elif method == "Unwatch":
+                source, token = params.unpack()
+                self.all[source].unwatch(token)
                 invocation.return_value(None)
             elif method == "Pin":
                 profile, seconds = params.unpack()

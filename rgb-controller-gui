@@ -1312,9 +1312,11 @@ class TriggersPage(FormPage):
         self.w_job = QCheckBox("KDE job views")
         self.w_launcher = QCheckBox("Taskbar progress")
         self.w_notif = QCheckBox("Notifications that carry a progress bar")
+        self.w_proc = QCheckBox("Real pacman inside cachy-update")
         for c, desc in ((self.w_job, "Dolphin copies/moves, Discover, KIO downloads."),
                         (self.w_launcher, "Browser downloads and installers (com.canonical.Unity.LauncherEntry)."),
-                        (self.w_notif, "")):
+                        (self.w_notif, ""),
+                        (self.w_proc, "Lights Loading only during the inner pacman step of cachy-update, not the whole run.")):
             c.toggled.connect(self.changed)
             self.body.addWidget(check_row(c, desc))
         self.body.addSpacing(4)
@@ -1323,7 +1325,8 @@ class TriggersPage(FormPage):
         self.ign_notif.changed.connect(self.changed)
         self.body.addWidget(self.ign_notif)
         self.body.addWidget(hint("Terminal jobs (pacman, paru, cachyos-rate-mirrors...) come from the Fish wrapper, "
-                                 "see the README. Watching is switched off while you are on battery."))
+                                 "see the README. cachy-update opens a watch window and only its inner pacman "
+                                 "lights Loading. Watching is switched off while you are on battery."))
 
         self.body.addWidget(heading("Media"))
         self.body.addWidget(wrap_label("A player counts as Spotify when its MPRIS name contains:"))
@@ -1385,6 +1388,7 @@ class TriggersPage(FormPage):
         self.w_job.setChecked(v.get("watch_jobview", True))
         self.w_launcher.setChecked(v.get("watch_launcher", True))
         self.w_notif.setChecked(v.get("watch_notifications", True))
+        self.w_proc.setChecked(v.get("watch_proc_pacman", True))
         self.ign_notif.set(v.get("ignore_notification_apps", []))
         self.hints.set(v.get("spotify_hints", []))
         self.beats.setChecked(v.get("spotify_beats_other_media", True))
@@ -1397,6 +1401,7 @@ class TriggersPage(FormPage):
         v["watch_jobview"] = self.w_job.isChecked()
         v["watch_launcher"] = self.w_launcher.isChecked()
         v["watch_notifications"] = self.w_notif.isChecked()
+        v["watch_proc_pacman"] = self.w_proc.isChecked()
         v["ignore_notification_apps"] = self.ign_notif.get()
         v["spotify_hints"] = self.hints.get()
         v["spotify_beats_other_media"] = self.beats.isChecked()
@@ -1570,6 +1575,7 @@ class TimingPage(FormPage):
         ("debounce_ms", "Debounce", "ms", 0, 5000, 50, "Bursts of events (a track change, a window of D-Bus chatter) become one decision."),
         ("loading_grace_ms", "Loading grace", "ms", 0, 30000, 100, "Progress shorter than this never shows Loading (no flicker for tiny copies)."),
         ("loading_linger_ms", "Loading linger", "ms", 0, 30000, 100, "Keep Loading this long after the last job ends, so back-to-back jobs do not flap."),
+        ("proc_scan_ms", "Pacman scan", "ms", 100, 5000, 100, "How often to check for the real pacman inside cachy-update while a watch window is open."),
         ("resume_settle_ms", "Resume settle", "ms", 0, 30000, 100, "After suspend, wait this long before touching USB devices again."),
         ("progress_stale_s", "Stale progress", "s", 10, 86400, 30, "Forget a progress bar nobody has updated for this long (crashed app)."),
         ("openrgb_timeout_s", "OpenRGB timeout", "s", 3, 300, 1, "Kill an openrgb call that takes longer than this."),
@@ -1606,7 +1612,7 @@ class TimingPage(FormPage):
 
         groups = [
             ("Reaction speed", "How quickly the lights follow what you are doing.",
-             ["debounce_ms", "loading_grace_ms", "loading_linger_ms", "media_off_delay_s"]),
+             ["debounce_ms", "loading_grace_ms", "loading_linger_ms", "proc_scan_ms", "media_off_delay_s"]),
             ("Hardware", "How patiently the daemon talks to your devices.",
              ["resume_settle_ms", "openrgb_timeout_s", "retry"]),
             ("Safety nets", "Clean-up for things that never finished.",

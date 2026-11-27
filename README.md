@@ -175,6 +175,8 @@ spotify_beats_other_media = true
 watch_jobview = true
 watch_launcher = true
 watch_notifications = true
+watch_proc_pacman = true
+proc_scan_ms = 500
 ignore_notification_apps = ["Spotify"]
 openrgb_cmd = ["openrgb", "--client", "localhost:6742"]
 ```
@@ -226,6 +228,7 @@ rgbctl log                 # Recent daemon log lines
 rgbctl hold loading pkg-123 1234  # Manual hold (source, token, PID)
 rgbctl release loading pkg-123
 rgbctl run loading -- pacman -Syu  # Hold while command runs
+rgbctl watch loading -- cachy-update  # Watch window: light Loading only while the inner pacman runs
 rgbctl gui                 # Open GUI
 ```
 
@@ -258,6 +261,13 @@ Customize:
 ```fish
 set -U rgb_loading_cmds pacman paru yay cachyos-rate-mirrors flatpak topgrade
 ```
+
+**`cachy-update` watch window:** `cachy-update` is in a separate list (`rgb_watch_cmds`, default
+`cachy-update`) because it must **not** hold `Loading` for its whole run. Instead the wrapper opens
+a short-lived *watch window* and the daemon scans `/proc` for the **real inner `pacman`** (the
+`sudo pacman -Syu` step), lighting `Loading` only while that pacman actually runs — off again
+during the AUR / flatpak / cache / news steps. Pure refresh (`-Sy`), queries (`-Ss`, `-Q`, ...) and
+fakeroot-driven pacman never count. Customize with `set -U rgb_watch_cmds cachy-update`.
 
 ### GUI Tray Behavior
 
