@@ -7,9 +7,9 @@
 #   game-rgb stop            # called by Lutris post-exit script
 #   game-rgb run CMD...      # run a command with the hold (like `rgbctl run gaming`)
 
-SVC=org.rgbcontroller.Daemon
-OBJ=/org/rgbcontroller/Daemon
-IFACE=org.rgbcontroller.Daemon1
+SVC=io.github.thakshiladamsak.RGBController
+OBJ=/io/github/thakshiladamsak/RGBController
+IFACE=io.github.thakshiladamsak.RGBController
 
 call() { busctl --user --timeout=3 call "$SVC" "$OBJ" "$IFACE" "$@"; }
 quiet() { call "$@" >/dev/null 2>&1; }

@@ -41,9 +41,9 @@ from PySide6.QtWidgets import (
     QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-SERVICE = "org.rgbcontroller.Daemon"
-OBJ_PATH = "/org/rgbcontroller/Daemon"
-IFACE = "org.rgbcontroller.Daemon1"
+SERVICE = "io.github.thakshiladamsak.RGBController"
+OBJ_PATH = "/io/github/thakshiladamsak/RGBController"
+IFACE = "io.github.thakshiladamsak.RGBController"
 UNIT = "rgb-controller.service"
 APP_ID = "rgb-controller-gui"
 

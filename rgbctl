@@ -12,9 +12,9 @@
 #   rgbctl watch SOURCE -- CMD ARGS... open a /proc watch window while CMD runs (cachy-update inner pacman)
 #   rgbctl gui                       open the GUI
 
-SVC=org.rgbcontroller.Daemon
-OBJ=/org/rgbcontroller/Daemon
-IFACE=org.rgbcontroller.Daemon1
+SVC=io.github.thakshiladamsak.RGBController
+OBJ=/io/github/thakshiladamsak/RGBController
+IFACE=io.github.thakshiladamsak.RGBController
 
 call() { busctl --user --timeout=3 call "$SVC" "$OBJ" "$IFACE" "$@"; }
 quiet() { call "$@" >/dev/null 2>&1; }

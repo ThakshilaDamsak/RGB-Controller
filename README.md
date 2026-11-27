@@ -66,7 +66,7 @@ Event-driven OpenRGB profile switcher for Linux. Zero idle CPU, fully configurab
              │                 │                  │
              ▼                 ▼                  ▼
     ┌──────────────────────────────────────────────────────┐
-    │              D-Bus: org.rgbcontroller.Daemon         │
+    │    D-Bus: io.github.thakshiladamsak.RGBController   │
     │  Hold/Release, Watch/Unwatch, Pin/Unpin,             │
     │  Reevaluate, Reload, Status, Config, History         │
     └──────────────────────────────────────────────────────┘

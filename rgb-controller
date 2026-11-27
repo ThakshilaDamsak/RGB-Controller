@@ -30,7 +30,7 @@ Adding a trigger, e.g. "camera in use":
 
     SOURCES["camera"] = CameraSource      # then add "camera" to PRIORITY
 
-External processes talk to the daemon over the session bus (org.rgbcontroller.Daemon):
+External processes talk to the daemon over the session bus (io.github.thakshiladamsak.RGBController):
 Hold/Release, Pin/Unpin, Reevaluate, Reload, Status, Config, History and the signals
 StateChanged / Log. Use the `rgbctl` and `game-rgb` helper scripts rather than calling it by hand.
 """
@@ -209,9 +209,9 @@ def ok_profile(name):
 
 load_config()
 
-BUS_NAME = "org.rgbcontroller.Daemon"
-OBJ_PATH = "/org/rgbcontroller/Daemon"
-IFACE = "org.rgbcontroller.Daemon1"
+BUS_NAME = "io.github.thakshiladamsak.RGBController"
+OBJ_PATH = "/io/github/thakshiladamsak/RGBController"
+IFACE = "io.github.thakshiladamsak.RGBController"
 INTROSPECTION = f"""
 <node>
   <interface name="{IFACE}">
