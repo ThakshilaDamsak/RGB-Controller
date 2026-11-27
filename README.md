@@ -193,7 +193,7 @@ priority = ["pin", "loading", "gaming", "media", "schedule", "power"]
 debounce_ms = 400
 loading_grace_ms = 1500
 loading_linger_ms = 3000
-media_off_delay_ms = 30000
+media_off_delay_ms = 15000
 spotify_hints = ["spotify"]
 spotify_beats_other_media = true
 watch_jobview = true
@@ -218,7 +218,7 @@ AC power is a **hard gate**: on battery → `Off` profile, everything else pause
 
 ### Media OFF Delay
 
-When non-Spotify media starts playing (browser video, mpv, VLC), the daemon waits **30 seconds** (default, configurable) before switching to the `Off` profile. This prevents lights from flickering when scrolling past videos on media-heavy sites.
+When non-Spotify media starts playing (browser video, mpv, VLC), the daemon waits **15 seconds** (default, configurable) before switching to the `Off` profile. This prevents lights from flickering when scrolling past videos on media-heavy sites.
 
 - **Spotify is immediate** — No delay, switches to `Rainbow` instantly.
 - **Customizable** — GUI → Timing page → "Media OFF delay" (0 = instant, up to 5 minutes).
