@@ -83,6 +83,19 @@ systemctl --user daemon-reload 2>/dev/null || true
             echo "  or start it manually with: systemctl --user start rgb-controller.service" >&2
         fi
 
+        # Restart the GUI (if running) so it picks up the renamed D-Bus name.
+        # rgb-controller-gui reads SERVICE/OBJ_PATH/IFACE at startup; a running
+        # instance keeps the old name until restarted. Best-effort only: never
+        # fail the install over a user-session GUI we can't reach.
+        if pgrep -u "$SUDO_USER" -x "rgb-controller-gui" >/dev/null 2>&1; then
+            echo "Restarting rgb-controller-gui for user $SUDO_USER (new D-Bus name)..."
+            pkill -TERM -u "$SUDO_USER" -x "rgb-controller-gui" 2>/dev/null || true
+            sleep 1
+            sudo -u "$SUDO_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" \
+                bash -c 'nohup rgb-controller-gui --tray >/dev/null 2>&1 &' 2>/dev/null || true
+            echo "  (If it did not relaunch, start it manually: rgb-controller-gui --tray)"
+        fi
+
     # Remove known-legacy autostart to prevent double GUI launch on upgrade
     USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
     sudo -u "$SUDO_USER" rm -f "$USER_HOME/.config/autostart/rgb-controller-gui-autostart.desktop" 2>/dev/null || true

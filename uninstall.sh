@@ -22,10 +22,24 @@ echo "Uninstalling rgb-controller..."
 # Stop and disable service for current user (if running via sudo)
 if [ -n "${SUDO_USER:-}" ]; then
     echo "Stopping service for user $SUDO_USER..."
-    sudo -u "$SUDO_USER" systemctl --user stop rgb-controller.service 2>/dev/null || true
-    sudo -u "$SUDO_USER" systemctl --user disable rgb-controller.service 2>/dev/null || true
-    # Remove GUI autostart (current + legacy)
-    USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    USER_UID=$(id -u "$SUDO_USER")
+    # systemctl --user needs the target user's XDG_RUNTIME_DIR; sudo scrubs it.
+    if ! sudo -u "$SUDO_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" \
+        systemctl --user stop rgb-controller.service; then
+        echo "Warning: could not stop rgb-controller.service for $SUDO_USER" >&2
+    fi
+        if ! sudo -u "$SUDO_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" \
+            systemctl --user disable rgb-controller.service; then
+            echo "Warning: could not disable rgb-controller.service for $SUDO_USER" >&2
+        fi
+        # Stop the GUI (if running) so it doesn't keep trying to reach the
+        # removed daemon; best-effort, never fails uninstall.
+        if pgrep -u "$SUDO_USER" -x "rgb-controller-gui" >/dev/null 2>&1; then
+            echo "Stopping rgb-controller-gui for user $SUDO_USER..."
+            pkill -TERM -u "$SUDO_USER" -x "rgb-controller-gui" 2>/dev/null || true
+        fi
+        # Remove GUI autostart (current + legacy)
+        USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
     sudo -u "$SUDO_USER" rm -f "$USER_HOME/.config/autostart/rgb-controller-gui-autostart.desktop" "$USER_HOME/.config/autostart/rgb-controller-gui.desktop" 2>/dev/null || true
 fi
 
