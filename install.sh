@@ -12,11 +12,12 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_DIR="/usr/local/bin"
-SYSTEMD_USER_DIR="/usr/lib/systemd/user"
-DESKTOP_DIR="/usr/share/applications"
-ICON_DIR="/usr/share/icons/hicolor/scalable/apps"
-FISH_DIR="/usr/share/fish/vendor_conf.d"
+
+# Shared library (constants, locking, manifest, obsolete logic)
+# shellcheck source=rgb-install-lib.sh
+source "$SCRIPT_DIR/rgb-install-lib.sh"
+
+acquire_lock
 
 echo "Installing rgb-controller..."
 
@@ -63,13 +64,20 @@ systemctl --user daemon-reload 2>/dev/null || true
 if [ -n "${SUDO_USER:-}" ]; then
     echo "Enabling service for user $SUDO_USER..."
     sudo -u "$SUDO_USER" systemctl --user enable rgb-controller.service 2>/dev/null || true
-    sudo -u "$SUDO_USER" systemctl --user start rgb-controller.service 2>/dev/null || true
-    # Enable GUI autostart (regular desktop entry with --tray)
+    sudo -u "$SUDO_USER" systemctl --user restart rgb-controller.service 2>/dev/null || true
+
+    # Remove known-legacy autostart to prevent double GUI launch on upgrade
     USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    sudo -u "$SUDO_USER" rm -f "$USER_HOME/.config/autostart/rgb-controller-gui-autostart.desktop" 2>/dev/null || true
+    # Enable GUI autostart (regular desktop entry with --tray)
     sudo -u "$SUDO_USER" mkdir -p "$USER_HOME/.config/autostart"
     sed 's|^Exec=rgb-controller-gui$|Exec=rgb-controller-gui --tray|' "$SCRIPT_DIR/rgb-controller-gui.desktop" > "$USER_HOME/.config/autostart/rgb-controller-gui.desktop"
     chown "$SUDO_USER" "$USER_HOME/.config/autostart/rgb-controller-gui.desktop"
 fi
+
+# Record manifest of installed system files
+record_manifest
+release_lock
 
 echo ""
 echo "Installation complete!"

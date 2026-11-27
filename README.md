@@ -329,6 +329,21 @@ sudo ./uninstall.sh
 
 Removes binaries, systemd service, desktop entries, icon, fish wrapper. Keeps user config in `~/.config/rgb-controller/`.
 
+## Update
+
+```bash
+sudo ./update.sh
+```
+
+`update.sh` reinstalls the current release (optionally pulling `git pull --ff-only` first when run inside the git checkout), then detects and removes files that a previous version installed but the current release no longer ships (e.g. the legacy `rgb-controller-gui-autostart.desktop`). It records what it installs in `/var/lib/rgb-controller/installed-files.txt` so obsolete files can be detected on future updates.
+
+Options:
+- `--no-pull` — skip the git pull step
+- `--yes` — skip the obsolete-file confirmation prompt
+- `--dry-run` — print what would be removed without making changes
+
+Obsolete file removal is interactive by default (`[y/N]`) and only touches files under known install prefixes (`/usr/local/bin`, `/usr/share/applications`, `/usr/share/icons/...`, `/usr/share/fish/vendor_conf.d`, `/usr/lib/systemd/user`).
+
 ## File Overview
 
 | File | Purpose |
@@ -342,7 +357,8 @@ Removes binaries, systemd service, desktop entries, icon, fish wrapper. Keeps us
 | `rgb-controller-gui.desktop` | App menu entry |
 | `rgb-controller-gui-autostart.desktop` | Tray autostart |
 | `rgb-controller.svg` | App icon |
-| `install.sh` / `uninstall.sh` | Install/uninstall scripts |
+| `install.sh` / `uninstall.sh` / `update.sh` | Install/uninstall/update scripts |
+| `rgb-install-lib.sh` | Shared library sourced by the scripts (not installed) |
 
 ## License
 
