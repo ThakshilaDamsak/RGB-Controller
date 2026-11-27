@@ -24,42 +24,66 @@ Event-driven OpenRGB profile switcher for Linux. Zero idle CPU, fully configurab
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                    rgb-controller (daemon)                 │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
-│  │ AC Power │  │ Loading  │  │ Gaming   │  │ Media      │  │
-│  │ (UPower) │  │ (DBus    │  │ (Hold    │  │ (MPRIS     │  │
-│  │ + sysfs) │  │  monitor)│  │  source) │  │  players)  │  │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬──────┘  │
-│       │             │             │              │         │
-│       └─────────────┴──────┬──────┴──────────────┘         │
-│                            ▼                               │
-│               ┌───────────────────────┐                    │
-│               │   Priority Evaluator  │                    │
-│               │  (first match wins)   │                    │
-│               └───────────┬───────────┘                    │
-│                           ▼                                │
-│               ┌───────────────────────┐                    │
-│               │    Profile Runner     │                    │
-│               │ (openrgb --profile X) │                    │
-│               │  retries, timeouts    │                    │
-│               └───────────────────────┘                    │
-└────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                        rgb-controller (daemon)                       │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │ Sources (enabled = started, gate = pauses all below when active) │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐            │  │
+│  │  │   AC    │  │   Pin   │  │ Loading │  │ Gaming  │            │  │
+│  │  │ (gate)  │  │(manual) │  │         │  │(holds)  │            │  │
+│  │  │ UPower  │  │ override│  │ DBus    │  │ game-   │            │  │
+│  │  │ + sysfs │  │         │  │ monitor │  │ rgb     │            │  │
+│  │  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘            │  │
+│  │       │            │            │            │                 │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐            │  │
+│  │  │ Schedule│  │  Media  │  │  Power  │            │  │
+│  │  │ (time   │  │ (MPRIS) │  │ (PPD)   │            │  │
+│  │  │ windows)│  │         │  │         │            │  │
+│  │  └────┬────┘  └────┬────┘  └────┬────┘            │  │
+│  └───────┼────────────┼────────────┼──────────────────────────────┘  │
+│          │            │            │                                 │
+│          ▼            ▼            ▼                                 │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │           Priority Evaluator (first match wins)              │   │
+│  │  Order: AC(gate) → pin → loading → gaming → media            │   │
+│  │         → schedule → power → Default                         │   │
+│  └────────────────────────────┬─────────────────────────────────┘   │
+│                               ▼                                     │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │              Profile Runner (openrgb --profile X)            │   │
+│  │         retries (2/5/15s), timeouts (30s), suspend-safe      │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────┘
                               ▲
-                ┌─────────────┴─────────────┐
-                ▼                           ▼
-      ┌───────────────────┐      ┌────────────────────┐
-      │   rgbctl (CLI)    │      │ rgb-controller-gui │
-      │  status, pin,     │      │  (Qt6, tray,       │
-      │  hold, run, log   │      │   live view)       │
-      └───────────────────┘      └────────────────────┘
-                ▲                           ▲
-                │                           │
-      ┌─────────┴──────────┐      ┌─────────┴─────────┐
-      │  game-rgb (Lutris) │      │  rgb-loading.fish │
-      │  start / stop      │      │  pacman, paru,    │
-      │  hold for PID      │      │  yay, etc.        │
-      └────────────────────┘      └───────────────────┘
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+    ┌─────────────────┐ ┌──────────────┐ ┌──────────────────┐
+    │   rgbctl (CLI)  │ │rgb-controller│ │  game-rgb        │
+    │ status, pin,    │ │    -gui      │ │  (Lutris/Steam)  │
+    │ hold, run,      │ │  (Qt6, tray, │ │  run/start/stop  │
+    │ watch, log      │ │   live view) │ │  → Hold/Watch    │
+    └────────┬────────┘ └──────┬───────┘ └────────┬─────────┘
+             │                 │                  │
+             ▼                 ▼                  ▼
+    ┌──────────────────────────────────────────────────────┐
+    │              D-Bus: org.rgbcontroller.Daemon         │
+    │  Hold/Release, Watch/Unwatch, Pin/Unpin,             │
+    │  Reevaluate, Reload, Status, Config, History         │
+    └──────────────────────────────────────────────────────┘
+                              ▲
+                              │
+                 ┌────────────┴────────────┐
+                 ▼                         ▼
+        ┌─────────────────┐        ┌──────────────────┐
+        │ rgb-loading.fish│        │  External events │
+        │ pacman, paru,   │        │  UPower (AC/batt)│
+        │ yay, flatpak,   │        │  MPRIS players   │
+        │ cachy-update,   │        │  KDE JobView     │
+        │ topgrade        │        │  Unity Launcher  │
+        │ → Hold/Watch    │        │  Notifications   │
+        └─────────────────┘        │  power-profiles  │
+                                   │  inotify(config) │
+                                   └──────────────────┘
 ```
 
 ## Installation
