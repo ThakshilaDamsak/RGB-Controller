@@ -45,21 +45,21 @@ Event-driven OpenRGB profile switcher for Linux. Zero idle CPU, fully configurab
 │               │  retries, timeouts    │                    │
 │               └───────────────────────┘                    │
 └────────────────────────────────────────────────────────────┘
-                            ▲
-              ┌─────────────┴─────────────┐
-              ▼                           ▼
-    ┌───────────────────┐      ┌────────────────────┐
-    │   rgbctl (CLI)    │      │ rgb-controller-gui │
-    │  status, pin,     │      │  (Qt6, tray,       │
-    │  hold, run, log   │      │   live view)       │
-    └───────────────────┘      └────────────────────┘
-              ▲                           ▲
-              │                           │
-    ┌─────────┴──────────┐      ┌─────────┴─────────┐
-    │  game-rgb (Lutris) │      │  rgb-loading.fish │
-    │  start / stop      │      │  pacman, paru,    │
-    │  hold for PID      │      │  yay, etc.        │
-    └────────────────────┘      └───────────────────┘
+                              ▲
+                ┌─────────────┴─────────────┐
+                ▼                           ▼
+      ┌───────────────────┐      ┌────────────────────┐
+      │   rgbctl (CLI)    │      │ rgb-controller-gui │
+      │  status, pin,     │      │  (Qt6, tray,       │
+      │  hold, run, log   │      │   live view)       │
+      └───────────────────┘      └────────────────────┘
+                ▲                           ▲
+                │                           │
+      ┌─────────┴──────────┐      ┌─────────┴─────────┐
+      │  game-rgb (Lutris) │      │  rgb-loading.fish │
+      │  start / stop      │      │  pacman, paru,    │
+      │  hold for PID      │      │  yay, etc.        │
+      └────────────────────┘      └───────────────────┘
 ```
 
 ## Installation
