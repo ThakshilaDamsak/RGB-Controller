@@ -144,6 +144,6 @@ echo "cachy-update uses a watch window (rgb_watch_cmds): only its real inner pac
 echo "lights Loading, detected automatically by the daemon (no wrapper changes needed)."
 echo ""
 echo "Media OFF delay (prevents flicker when scrolling past videos):"
-echo "  GUI → Timing page → \"Media OFF delay\" (default 30s, set 0 for instant)"
+echo "  GUI → Timing page → \"Media OFF delay\" (default 15s, set 0 for instant)"
 echo ""
 echo "Uninstall with: sudo ./uninstall.sh"

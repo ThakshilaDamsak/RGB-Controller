@@ -93,7 +93,7 @@ LOADING_LINGER_MS = 3000             # keep Loading this long after the last job
 RESUME_SETTLE_MS = 2500              # after suspend: let USB/OpenRGB come back before touching LEDs
 PROGRESS_STALE_S = 900               # drop a progress item nobody has updated for this long
 HOLD_MAX_HOURS = 12.0                # safety net: a game-rgb hold without a pid expires after this (0 = never)
-MEDIA_OFF_DELAY_MS = 30000           # wait this long after non-Spotify media starts before turning lights off (0 = instant)
+MEDIA_OFF_DELAY_MS = 15000           # wait this long after non-Spotify media starts before turning lights off (0 = instant)
 
 # Progress sources for the Loading state
 WATCH_JOBVIEW = True                 # KDE job views (Dolphin copies, Discover, KIO...)
@@ -673,7 +673,7 @@ class MediaSource(Source):
     """MPRIS players: Spotify -> PROFILE_SPOTIFY, anything else playing -> PROFILE_OTHER_MEDIA,
     MEDIA_RULES can map specific players to their own profile.
 
-    Non-Spotify media triggers PROFILE_OTHER_MEDIA after MEDIA_OFF_DELAY_MS (default 30s).
+    Non-Spotify media triggers PROFILE_OTHER_MEDIA after MEDIA_OFF_DELAY_MS (default 15s).
     This prevents lights from turning off when scrolling past videos on media-heavy sites.
     Spotify is immediate and ignores this delay.
     """

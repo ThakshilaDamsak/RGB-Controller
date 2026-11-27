@@ -24,66 +24,66 @@ Event-driven OpenRGB profile switcher for Linux. Zero idle CPU, fully configurab
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                        rgb-controller (daemon)                       │
-│  ┌────────────────────────────────────────────────────────────────┐  │
+┌────────────────────────────────────────────────────────────────────────┐
+│                        rgb-controller (daemon)                         │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
 │  │ Sources (enabled = started, gate = pauses all below when active) │  │
-│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐            │  │
-│  │  │   AC    │  │   Pin   │  │ Loading │  │ Gaming  │            │  │
-│  │  │ (gate)  │  │(manual) │  │         │  │(holds)  │            │  │
-│  │  │ UPower  │  │ override│  │ DBus    │  │ game-   │            │  │
-│  │  │ + sysfs │  │         │  │ monitor │  │ rgb     │            │  │
-│  │  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘            │  │
-│  │       │            │            │            │                 │  │
-│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐            │  │
-│  │  │ Schedule│  │  Media  │  │  Power  │            │  │
-│  │  │ (time   │  │ (MPRIS) │  │ (PPD)   │            │  │
-│  │  │ windows)│  │         │  │         │            │  │
-│  │  └────┬────┘  └────┬────┘  └────┬────┘            │  │
-│  └───────┼────────────┼────────────┼──────────────────────────────┘  │
-│          │            │            │                                 │
-│          ▼            ▼            ▼                                 │
-│  ┌──────────────────────────────────────────────────────────────┐   │
-│  │           Priority Evaluator (first match wins)              │   │
-│  │  Order: AC(gate) → pin → loading → gaming → media            │   │
-│  │         → schedule → power → Default                         │   │
-│  └────────────────────────────┬─────────────────────────────────┘   │
-│                               ▼                                     │
-│  ┌──────────────────────────────────────────────────────────────┐   │
-│  │              Profile Runner (openrgb --profile X)            │   │
-│  │         retries (2/5/15s), timeouts (30s), suspend-safe      │   │
-│  └──────────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────────┘
-                              ▲
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-    ┌─────────────────┐ ┌──────────────┐ ┌──────────────────┐
-    │   rgbctl (CLI)  │ │rgb-controller│ │  game-rgb        │
-    │ status, pin,    │ │    -gui      │ │  (Lutris/Steam)  │
-    │ hold, run,      │ │  (Qt6, tray, │ │  run/start/stop  │
-    │ watch, log      │ │   live view) │ │  → Hold/Watch    │
-    └────────┬────────┘ └──────┬───────┘ └────────┬─────────┘
-             │                 │                  │
-             ▼                 ▼                  ▼
-    ┌──────────────────────────────────────────────────────┐
-    │    D-Bus: io.github.thakshiladamsak.RGBController   │
-    │  Hold/Release, Watch/Unwatch, Pin/Unpin,             │
-    │  Reevaluate, Reload, Status, Config, History         │
-    └──────────────────────────────────────────────────────┘
-                              ▲
-                              │
-                 ┌────────────┴────────────┐
-                 ▼                         ▼
-        ┌─────────────────┐        ┌──────────────────┐
-        │ rgb-loading.fish│        │  External events │
-        │ pacman, paru,   │        │  UPower (AC/batt)│
-        │ yay, flatpak,   │        │  MPRIS players   │
-        │ cachy-update,   │        │  KDE JobView     │
-        │ topgrade        │        │  Unity Launcher  │
-        │ → Hold/Watch    │        │  Notifications   │
-        └─────────────────┘        │  power-profiles  │
-                                   │  inotify(config) │
-                                   └──────────────────┘
+│  │        ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐        │  │
+│  │        │   AC    │  │   Pin   │  │ Loading │  │ Gaming  │        │  │
+│  │        │ (gate)  │  │(manual) │  │         │  │(holds)  │        │  │
+│  │        │ UPower  │  │ override│  │ DBus    │  │ game-   │        │  │
+│  │        │ + sysfs │  │         │  │ monitor │  │ rgb     │        │  │
+│  │        └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘        │  │
+│  │             │            │            │            │             │  │
+│  │        ┌─────────┐  ┌─────────┐  ┌─────────┐       │             │  │
+│  │        │ Schedule│  │  Media  │  │  Power  │       │             │  │
+│  │        │ (time   │  │ (MPRIS) │  │ (PPD)   │       │             │  │
+│  │        │ windows)│  │         │  │         │       │             │  │
+│  │        └────┬────┘  └────┬────┘  └────┬────┘       │             │  │
+│  └─────────────┼────────────┼────────────┼────────────┼─────────────┘  │
+│                │            │            │            │                │
+│                ▼            ▼            ▼            ▼                │
+│    ┌──────────────────────────────────────────────────────────────┐    │
+│    │           Priority Evaluator (first match wins)              │    │
+│    │     Order: AC(gate) → pin → loading → gaming → media         │    │
+│    │              → schedule → power → Default                    │    │
+│    └──────────────────────────────┬───────────────────────────────┘    │
+│                                   ▼                                    │
+│   ┌────────────────────────────────────────────────────────────────┐   │
+│   │              Profile Runner (openrgb --profile X)              │   │
+│   │         retries (2/5/15s), timeouts (30s), suspend-safe        │   │
+│   └────────────────────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────────────────┘
+                                    ▲
+                    ┌───────────────┼───────────────┐
+                    ▼               ▼               ▼
+        ┌─────────────────┐ ┌──────────────┐ ┌──────────────────┐
+        │   rgbctl (CLI)  │ │rgb-controller│ │  game-rgb        │
+        │ status, pin,    │ │    -gui      │ │  (Lutris/Steam)  │
+        │ hold, run,      │ │  (Qt6, tray, │ │  run/start/stop  │
+        │ watch, log      │ │   live view) │ │  → Hold/Watch    │
+        └────────┬────────┘ └──────┬───────┘ └────────┬─────────┘
+                 │                 │                  │
+                 ▼                 ▼                  ▼
+        ┌──────────────────────────────────────────────────────┐
+        │    D-Bus: io.github.thakshiladamsak.RGBController    │
+        │       Hold/Release, Watch/Unwatch, Pin/Unpin,        │
+        │     Reevaluate, Reload, Status, Config, History      │
+        └──────────────────────────────────────────────────────┘
+                                   ▲
+                                   │
+                      ┌────────────┴────────────┐
+                      ▼                         ▼
+            ┌──────────────────┐       ┌───────────────────┐
+            │ rgb-loading.fish │       │  External events  │
+            │  pacman, paru,   │       │  UPower (AC/batt) │
+            │  yay, flatpak,   │       │  MPRIS players    │
+            │  cachy-update,   │       │  KDE JobView      │
+            │  topgrade        │       │  Unity Launcher   │
+            │ → Hold/Watch     │       │  Notifications    │
+            └──────────────────┘       │  power-profiles   │
+                                       │  inotify(config)  │
+                                       └───────────────────┘
 ```
 
 ## Installation
@@ -193,7 +193,7 @@ priority = ["pin", "loading", "gaming", "media", "schedule", "power"]
 debounce_ms = 400
 loading_grace_ms = 1500
 loading_linger_ms = 3000
-media_off_delay_ms = 30000
+media_off_delay_ms = 15000
 spotify_hints = ["spotify"]
 spotify_beats_other_media = true
 watch_jobview = true
@@ -218,7 +218,7 @@ AC power is a **hard gate**: on battery → `Off` profile, everything else pause
 
 ### Media OFF Delay
 
-When non-Spotify media starts playing (browser video, mpv, VLC), the daemon waits **30 seconds** (default, configurable) before switching to the `Off` profile. This prevents lights from flickering when scrolling past videos on media-heavy sites.
+When non-Spotify media starts playing (browser video, mpv, VLC), the daemon waits **15 seconds** (default, configurable) before switching to the `Off` profile. This prevents lights from flickering when scrolling past videos on media-heavy sites.
 
 - **Spotify is immediate** — No delay, switches to `Rainbow` instantly.
 - **Customizable** — GUI → Timing page → "Media OFF delay" (0 = instant, up to 5 minutes).
