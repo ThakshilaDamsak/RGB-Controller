@@ -60,11 +60,28 @@ install -m 644 "$SCRIPT_DIR/rgb-loading.fish" "$FISH_DIR/rgb-loading.fish"
 echo "Reloading systemd user daemon..."
 systemctl --user daemon-reload 2>/dev/null || true
 
-# Enable and start the service for the current user (if running as non-root via sudo)
-if [ -n "${SUDO_USER:-}" ]; then
-    echo "Enabling service for user $SUDO_USER..."
-    sudo -u "$SUDO_USER" systemctl --user enable rgb-controller.service 2>/dev/null || true
-    sudo -u "$SUDO_USER" systemctl --user restart rgb-controller.service 2>/dev/null || true
+    # Enable and start the service for the current user (if running as non-root via sudo).
+    # systemctl --user needs the target user's XDG_RUNTIME_DIR to reach their systemd
+    # instance; sudo scrubs it, so we pass it explicitly. Do NOT silence failures: a
+    # failed enable/restart means the daemon won't autostart and users deserve to know.
+    if [ -n "${SUDO_USER:-}" ]; then
+        USER_UID=$(id -u "$SUDO_USER")
+        USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+
+        echo "Enabling service for user $SUDO_USER..."
+        if ! sudo -u "$SUDO_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" \
+            systemctl --user enable rgb-controller.service; then
+            echo "Warning: could not enable rgb-controller.service for $SUDO_USER" >&2
+            echo "  Autostart on login may not work; enable manually: systemctl --user enable rgb-controller.service" >&2
+        fi
+
+        echo "Starting service for user $SUDO_USER..."
+        if ! sudo -u "$SUDO_USER" env XDG_RUNTIME_DIR="/run/user/$USER_UID" \
+            systemctl --user restart rgb-controller.service; then
+            echo "Warning: could not start rgb-controller.service for $SUDO_USER" >&2
+            echo "  The daemon will start automatically on your next graphical-session login," >&2
+            echo "  or start it manually with: systemctl --user start rgb-controller.service" >&2
+        fi
 
     # Remove known-legacy autostart to prevent double GUI launch on upgrade
     USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
